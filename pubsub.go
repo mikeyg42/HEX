@@ -75,12 +75,11 @@ type TimerEvent struct {
 //................ commands ......................//
 
 var cmdTypeMap = map[string]interface{}{
-	"DeclaringMoveCmd":          &DeclaringMoveCmd{},
-	"PublishingMoveCmd":         &PublishingMoveCmd{},
-	"StartingGameCmd":           &StartingGameCmd{},
-	"EvaluatingMoveValidityCmd": &EvaluatingMoveValidityCmd{},
-	"PlayerForfeitingCmd":       &PlayerForfeitingCmd{},
-	"UpdatingGameStateCmd":      &UpdatingGameStateCmd{},
+	"DeclaringMoveCmd":           &DeclaringMoveCmd{},
+	"StartingGameCmd":            &StartingGameCmd{},
+	"EvaluatingMoveValidityCmd":  &EvaluatingMoveValidityCmd{},
+	"PlayerForfeitingCmd":        &PlayerForfeitingCmd{},
+	"UpdatingGameStateUpdateCmd": &UpdatingGameStateUpdateCmd{},
 }
 
 type DeclaringMoveCmd struct {
@@ -91,22 +90,15 @@ type DeclaringMoveCmd struct {
 	DeclaredMove   string    `json:"moveData"`
 	Timestamp      time.Time `json:"timestamp"`
 }
-type PublishingMoveCmd struct {
-	Command
-	ID             string    `json:"id"`
-	GameID         string    `json:"gameId"`
-	SourcePlayerID string    `json:"playerId"`
-	DeclaredMove   string    `json:"moveData"`
-	Timestamp      time.Time `json:"timestamp"`
-}
+
+// maybe should be  an event
 type StartingGameCmd struct {
 	Command
-	ID             string    `json:"id"`
-	GameID         string    `json:"gameId"`
-	SourcePlayerID string    `json:"playerId"`
-	DeclaredMove   string    `json:"moveData"`
-	Timestamp      time.Time `json:"timestamp"`
+	ID        string    `json:"id"`
+	GameID    string    `json:"gameId"`
+	Timestamp time.Time `json:"timestamp"`
 }
+
 type EvaluatingMoveValidityCmd struct {
 	Command
 	ID             string    `json:"id"`
@@ -125,7 +117,7 @@ type PlayerForfeitingCmd struct {
 	Timestamp      time.Time `json:"timestamp"`
 }
 
-type UpdatingGameStateCmd struct {
+type UpdatingGameStateUpdateCmd struct {
 	Command
 	ID             string    `json:"id"`
 	GameID         string    `json:"gameId"`
@@ -263,13 +255,12 @@ func (d *Dispatcher) initializeDb(eventCmdLogger Logger) {
 	}
 
 	// models.Player struct is automatically migrated to the database
-	db.AutoMigrate(&Gamestate{})
+	db.AutoMigrate(&GameStateUpdate{})
 
 	eventCmdLogger.InfoLog("connected to database", nil)
 
 	// declare DB as a Dbinstance, and thus a global
 	DB = Dbinstance{Db: db}
-
 }
 
 //................................................//
@@ -289,7 +280,7 @@ type Dbinstance struct {
 
 var DB Dbinstance
 
-type Gamestate struct {
+type GameStateUpdate struct {
 	gorm.Model
 	GameID      string `gorm:"index"`
 	MoveCounter int
@@ -323,7 +314,7 @@ func (e *OfficialMoveEvent) ModifyPersistedDataTable() error {
 		return err
 	}
 
-	gamestate := Gamestate{
+	GameStateUpdate := GameStateUpdate{
 		GameID:      e.GameID,
 		MoveCounter: moveCounterInt,
 		PlayerID:    playerID,
@@ -331,7 +322,7 @@ func (e *OfficialMoveEvent) ModifyPersistedDataTable() error {
 		YCoordinate: YCoordinateInt,
 	}
 
-	result := DB.Db.Create(&gamestate)
+	result := DB.Db.Create(&GameStateUpdate)
 
 	if result.RowsAffected != 1 {
 		fmt.Println("number of rows affected by DB update was not 1, but instead %v", result.RowsAffected)
@@ -348,7 +339,7 @@ func (e *OfficialMoveEvent) ModifyPersistedDataTable() error {
 // For GameEndsEvent
 func (e *GameEndsEvent) ModifyPersistedDataTable() error {
 
-	gamestate := &Gamestate{
+	GameStateUpdate := &GameStateUpdate{
 		GameID:      e.GameID,
 		MoveCounter: -99,
 		PlayerID:    e.WinnerID + " WINS",
@@ -356,7 +347,7 @@ func (e *GameEndsEvent) ModifyPersistedDataTable() error {
 		YCoordinate: 0,
 	}
 
-	err := DB.Db.Create(gamestate).Error
+	err := DB.Db.Create(GameStateUpdate).Error
 	if err != nil {
 		return err
 	}
@@ -514,35 +505,6 @@ func (d *Dispatcher) handleCommandWrapper(cmd interface{}) {
 	d.commandChan <- cmd
 }
 
-// Command Handler
-func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPubSub *redis.PubSub) {
-	switch cmd := cmd.(type) {
-	case *DeclaringMoveCmd:
-		// Handle declared move command
-		fmt.Println("Received DeclaringMoveCmd:", cmd)
-	case *PublishingMoveCmd:
-		// Handle PublishMove command
-		fmt.Println("Received PublishingMoveCmd:", cmd)
-	case *StartingGameCmd:
-		// Handle StartGame command
-		fmt.Println("Received StartingGameCmd:", cmd)
-	case *EvaluatingMoveValidityCmd:
-		// Handle EvaluateMoveValidity command
-		fmt.Println("Received EvaluatingMoveValidityCmd:", cmd)
-	case *PlayerForfeitingCmd:
-		// Handle Player Forfeiting command
-		fmt.Println("Received PlayerForfeitingCmd:", cmd)
-	case *UpdatingGameStateCmd:
-		// Handle Update Game State command
-		fmt.Println("Received UpdatingGameStateCmd:", cmd)
-
-	default:
-		d.errorLogger.Error("Unknown command type", nil, watermill.LogFields{"command": cmd})
-
-		fmt.Println("Unknown command type")
-	}
-}
-
 // Event Handler
 func (d *Dispatcher) handleEvent(done <-chan struct{}, event Event, eventPubSub *redis.PubSub) {
 	// define the context and cancel function for the countdown handler
@@ -640,29 +602,184 @@ func CountdownHandler(ctx context.Context, event Event) error {
 }
 
 //................................................//
-//..................CONSTRUCTORS..................//
 //................................................//
 
-// constructor function for EvaluatingMoveValidityCmd.
-func NewEvaluatingMoveValidityCmd(event *DeclareMoveEvent, validMove bool) *EvaluatingMoveValidityCmd {
+type AcceptedMoves struct {
+	list map[int]string // key is 1, 2, 3, 4,... Value is "a1", "b2", "h1", etc.
+}
 
-	validMove := evaluateMoveValidity(event)
+// populateAcceptedMoves_fromDB fetches data from the PostgreSQL database and populates the AcceptedMoves struct.
+func (d *Dispatcher) populateAcceptedMoves_fromDB(gameID string) (*AcceptedMoves, error) {
 
-	return &EvaluatingMoveValidityCmd{
-		ID:             uuid.New().String(),
-		GameID:         event.GameID,
-		SourcePlayerID: event.PlayerID,
-		DeclaredMove:   event.MoveData,
-		ValidMove:      validMove,
-		Timestamp:      time.Now(),
+	var gameStateUpdates []GameStateUpdate
+	acceptedMoves := AcceptedMoves{
+		list: make(map[int]string),
+	}
+
+	// Step 1: Sort by gameID and extract relevant columns
+	if err := DB.Db.Table("game_state_updates").
+		Select("move_counter, x_coordinate, y_coordinate").
+		Where("game_id = ?", gameID).
+		Order("move_counter").
+		Find(&gameStateUpdates).Error; err != nil {
+		return nil, err
+	}
+
+	// Process the result to create the AcceptedMoves map
+	for _, update := range gameStateUpdates {
+		// Convert YCoordinate to a string and concatenate XCoordinate and YCoordinate to form the map's value
+		yCoordinateStr := strconv.Itoa(update.YCoordinate)
+		concatenatedMoveData := update.XCoordinate + yCoordinateStr
+
+		// Use moveCounter as the key
+		acceptedMoves.list[update.MoveCounter] = concatenatedMoveData
+	}
+
+	return &acceptedMoves, nil
+}
+
+// populateAcceptedMoves_fromCache fetches data from the Redis cache and populates the AcceptedMoves struct.
+func (d *Dispatcher) populateAcceptedMoves_fromCache(gameID string) (*AcceptedMoves, error) {
+
+	moveList := make(map[string]string)
+	moveList, err := d.client.HGetAll(context.Background(), gameID).Result()
+	if err != nil {
+		d.errorLogger.ErrorLog("error extracting cache, resorting to use of DB", err)
+		return d.populateAcceptedMoves_fromDB(gameID)
+	}
+
+	// Convert the result to a Go map
+	allMoves := make(map[int]string, len(moveList))
+
+	// convert string to int
+	for field, value := range moveList {
+		f, err := strconv.Atoi(field)
+		if err != nil {
+			d.errorLogger.ErrorLog("error converting cache hash to Go map", err)
+			return d.populateAcceptedMoves_fromDB(gameID)
+		}
+		allMoves[f] = value
+	}
+
+	acceptedMoves := AcceptedMoves{
+		list: allMoves,
+	}
+
+	return &acceptedMoves, nil
+}
+
+func reverseMap(m map[int]string) map[string]int {
+	n := make(map[string]int, len(m))
+	for k, v := range m {
+		n[v] = k
+	}
+	return n
+}
+
+// Function to handle the command and validate the move
+func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPubSub *redis.PubSub) {
+	switch cmd := cmd.(type) {
+	case *DeclaringMoveCmd:
+		key := "acceptedMoveList"
+
+		numCache, err := d.getCacheSize(key)
+		if err != nil {
+			d.errorLogger.ErrorLog("error querying cache", err)
+		}
+
+		var acceptedMoves *AcceptedMoves
+
+		if numCache > 0 {
+			// then we can use the cache!
+			acceptedMoves, err = d.populateAcceptedMoves_fromCache(cmd.GameID)
+			if err != nil {
+				d.errorLogger.ErrorLog("error fetching accepted Move list! ", err)
+			}
+		} else if numCache < 0 { // cache is no bueno, use the DB
+			acceptedMoves, err := d.populateAcceptedMoves_fromDB(cmd.GameID)
+			if err != nil {
+				d.errorLogger.ErrorLog("error fetching accepted Move list! ", err)
+			}
+			d.client.HSet(context.Background(), key, acceptedMoves.list)
+		}
+
+		// extract the moveData from the command
+		moveData := cmd.DeclaredMove
+		moveParts := strings.Split(moveData, ".")
+		new_key, _ := strconv.Atoi(moveParts[0])
+		new_val := moveParts[2]
+
+		validMove := true
+		// first we check if the list of all moves contains already a move with the same moveCounter (ie the 25th tile is already set)
+		if _, ok := acceptedMoves.list[new_key]; ok {
+			d.errorLogger.InfoLog("This moveCounter value is already present in the AcceptedMoves list", moveData)
+			validMove = false
+		} else {
+			// second, we check if the unique moveCounter cooresponds to a unique coordinate
+			reversedMap := reverseMap(acceptedMoves.list)
+			if _, found := reversedMap[new_val]; found {
+				d.errorLogger.InfoLog("This xy coord pair is already present in the AcceptedMoves list", moveData)
+				validMove = false
+			}
+		}
+
+		newCmd := &EvaluatingMoveValidityCmd{
+			ID:             uuid.New().String(),
+			GameID:         cmd.GameID,
+			SourcePlayerID: cmd.SourcePlayerID,
+			DeclaredMove:   cmd.DeclaredMove,
+			ValidMove:      validMove,
+			Timestamp:      time.Now(),
+		}
+
+		d.commandChan <- newCmd
+
+	case *PublishingMoveCmd:
+		// Handle PublishMove command
+		fmt.Println("Received PublishingMoveCmd:", cmd)
+	case *StartingGameCmd:
+		// Handle StartGame command
+		fmt.Println("Received StartingGameCmd:", cmd)
+	case *EvaluatingMoveValidityCmd:
+		// Handle EvaluateMoveValidity command
+		fmt.Println("Received EvaluatingMoveValidityCmd:", cmd)
+
+	case *PlayerForfeitingCmd:
+		// Handle Player Forfeiting command
+		fmt.Println("Received PlayerForfeitingCmd:", cmd)
+	case *UpdatingGameStateUpdateCmd:
+		// Handle Update Game State command
+		fmt.Println("Received UpdatingGameStateUpdateCmd:", cmd)
+
+	default:
+		d.errorLogger.ErrorLog(fmt.Sprintf("Unknown command type %w", cmd), nil)
+
+		fmt.Println("Unknown command type")
 	}
 }
 
-//................................................//
-//................................................//
+func (d *Dispatcher) getCacheSize(key string) (int, error) {
 
-func evaluateMoveValidity(event *DeclareMoveEvent) bool {
+	//numElements, err := d.client.HLen(context.Background(), key).Result()
+	allKeys, err := (d.client.HKeys(context.Background(), key)).Result()
+	if err != nil {
+		d.errorLogger.ErrorLog("error querying caches key list", err)
+		return -1, nil
+	}
 
-	//TBD
+	numElements := len(allKeys)
+	maxCounter := 0
+	for p := range allKeys {
+		pp, _ := strconv.Atoi(allKeys[p])
+		if pp > maxCounter {
+			maxCounter = pp
+		}
+	}
 
+	if int(numElements) != maxCounter {
+		d.errorLogger.ErrorLog("error querying cache", fmt.Errorf("numElements != maxMoveCounter"))
+		return -1, nil
+	}
+
+	return maxCounter, nil
 }

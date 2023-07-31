@@ -4,15 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	watermill "github.com/ThreeDotsLabs/watermill"
-	"github.com/google/uuid"
 	redis "github.com/redis/go-redis/v9"
+
+	"github.com/google/uuid"
 	zap "go.uber.org/zap"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -25,11 +27,21 @@ import (
 
 // ................ events ......................//
 var eventTypeMap = map[string]interface{}{
-	"DeclaredMoveEvent": &DeclaredMoveEvent{},
-	"InvalidMoveEvent":  &InvalidMoveEvent{},
-	"OfficialMoveEvent": &OfficialMoveEvent{},
-	"GameEndsEvent":     &GameEndsEvent{},
-	"TimerEvent":        &TimerEvent{},
+	"GameAnnouncementEvent": &GameAnnouncementEvent{},
+	"DeclaredMoveEvent":     &DeclaredMoveEvent{},
+	"InvalidMoveEvent":      &InvalidMoveEvent{},
+	"OfficialMoveEvent":     &OfficialMoveEvent{},
+	"GameEndsEvent":         &GameEndsEvent{},
+	"GameStartEvent":        &GameStartEvent{},
+	"TimerEvent":            &TimerEvent{},
+}
+
+type GameAnnouncementEvent struct {
+	Event
+	GameID         string    `json:"gameId"`
+	FirstPlayerID  string    `json:"firstplayerID"`
+	SecondPlayerID string    `json:"secondplayerID"`
+	Timestamp      time.Time `json:"timestamp"`
 }
 
 type DeclaredMoveEvent struct {
@@ -42,12 +54,18 @@ type DeclaredMoveEvent struct {
 
 type InvalidMoveEvent struct {
 	Event
-	GameID   string `json:"gameId"`
-	PlayerID string `json:"playerId"`
-	MoveData string `json:"moveData"`
+	GameID      string `json:"gameId"`
+	PlayerID    string `json:"playerId"`
+	InvalidMove string `json:"moveData"`
 }
 
-// this includes the "start of game" event which will be effectively official move #0
+type GameStartEvent struct {
+	GameID         string
+	FirstPlayerID  string
+	SecondPlayerID string
+	Timestamp      time.Time
+}
+
 type OfficialMoveEvent struct {
 	Event
 	GameID    string    `json:"gameId"`
@@ -72,12 +90,26 @@ type TimerEvent struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+// ...................... game Lock ......................//
+const moveTimeout = 30 * time.Second
+
+// Define a struct to represent a locked game with two players
+type LockedGame struct {
+	WorkerID string
+	GameID   string
+	Player1  PlayerIdentity
+	Player2  PlayerIdentity
+}
+
+// Define a shared map to keep track of locked games
+var lockedGames = make(map[string]LockedGame)
+var lockMutex sync.Mutex
+
 //................ commands ......................//
 
 var cmdTypeMap = map[string]interface{}{
 	"DeclaringMoveCmd":           &DeclaringMoveCmd{},
-	"StartingGameCmd":            &StartingGameCmd{},
-	"EvaluatingMoveValidityCmd":  &EvaluatingMoveValidityCmd{},
+	"LetsStartTheGameCmd":        &LetsStartTheGameCmd{},
 	"PlayerForfeitingCmd":        &PlayerForfeitingCmd{},
 	"UpdatingGameStateUpdateCmd": &UpdatingGameStateUpdateCmd{},
 }
@@ -92,21 +124,12 @@ type DeclaringMoveCmd struct {
 }
 
 // maybe should be  an event
-type StartingGameCmd struct {
+type LetsStartTheGameCmd struct {
 	Command
-	ID        string    `json:"id"`
 	GameID    string    `json:"gameId"`
+	Player1   string    `json:"player1"`
+	Player2   string    `json:"player2"`
 	Timestamp time.Time `json:"timestamp"`
-}
-
-type EvaluatingMoveValidityCmd struct {
-	Command
-	ID             string    `json:"id"`
-	GameID         string    `json:"gameId"`
-	SourcePlayerID string    `json:"playerId"`
-	DeclaredMove   string    `json:"moveData"`
-	ValidMove      bool      `json:"validMove"`
-	Timestamp      time.Time `json:"timestamp"`
 }
 
 type PlayerForfeitingCmd struct {
@@ -115,6 +138,7 @@ type PlayerForfeitingCmd struct {
 	GameID         string    `json:"gameId"`
 	SourcePlayerID string    `json:"playerId"`
 	Timestamp      time.Time `json:"timestamp"`
+	Reason         string    `json:"reason"`
 }
 
 type UpdatingGameStateUpdateCmd struct {
@@ -126,7 +150,7 @@ type UpdatingGameStateUpdateCmd struct {
 	Timestamp      time.Time `json:"timestamp"`
 }
 
-//..............dispatcher ..................//
+//.............. Main Characters ...............//
 
 // Dispatcher represents the combined event and command dispatcher.
 type Dispatcher struct {
@@ -134,9 +158,28 @@ type Dispatcher struct {
 	eventChan       chan interface{}
 	client          *redis.Client
 	errorLogger     Logger
+	eventCmdLogger  Logger
 	commandHandlers map[string]func(interface{})
 	eventHandlers   map[string]func(interface{})
 }
+
+type Worker struct {
+	WorkerID      string
+	GameID        string
+	PlayerChan    chan PlayerIdentity
+	ReleasePlayer chan string // Channel to notify the worker to release the player
+}
+
+type PlayerIdentity struct {
+	PlayerID          string
+	CurrentGameID     string
+	CurrentOpponentID string
+	CurrentPlayerRank int
+	Username          string // Player's username (this is their actual username, whereas PlayerID will be a UUID+player1 or UUID+player2)
+}
+
+type eventCmdLoggerKey struct{}
+type errorLoggerKey struct{}
 
 //................................................//
 //................... MAIN .......................//
@@ -146,52 +189,37 @@ func main() {
 	eventCmdLogger := initLogger("/Users/mikeglendinning/projects/HEX/eventCommandLog.log", gormlogger.Info)
 	errorLogger := initLogger("/Users/mikeglendinning/projects/HEX/errorLog.log", gormlogger.Info)
 
+	eventCmdCtx := context.WithValue(context.Background(), eventCmdLoggerKey{}, eventCmdLogger)
+	ctx := context.WithValue(eventCmdCtx, errorLoggerKey{}, errorLogger)
+
+	eventCmdLogger.ZapLogger.Sync()
+	errorLogger.ZapLogger.Sync()
+	eventCmdLogger.InfoLog(eventCmdCtx, "EventCmdLogger Initiated", zap.Bool("EventCmdLogger Activation", true))
+	errorLogger.InfoLog(ctx, "ErrorLogger Initiated", zap.Bool("ErrorLogger Activation", true))
+
 	client, err := getRedisClient()
 	if err != nil {
-		errorLogger.ErrorLog("Error connecting to Redis:", err)
+		errorLogger.ErrorLog(ctx, "Error getting Redis Client", zap.Bool("get redisClient", false))
 		return
 	}
 
 	// Initialize command and event dispatchers
-	d := NewDispatcher(client, errorLogger)
+	d := NewDispatcher(client, errorLogger, eventCmdLogger)
 
-	// Start the dispatchers
-	d.Start()
-
-	// Example of dispatching a command and publishing an event
-	cmd := &DeclaringMoveCmd{
-		GameID:         "your_game_id",
-		SourcePlayerID: "player1",
-		DeclaredMove:   "4.P1.B5",
-		Timestamp:      time.Now(),
+	// Initialize database
+	err = d.initializeDb()
+	if err != nil {
+		errorLogger.ErrorLog(ctx, "Error initializing the database:", zap.Error(err))
+		return
 	}
-	logCommand(cmd, eventCmdLogger)
-	d.CommandDispatcher(cmd)
 
-	event := &InvalidMoveEvent{
-		GameID:   "your_game_id",
-		PlayerID: "player1",
-		MoveData: "4.P1.B5",
-	}
-	logEvent(event, eventCmdLogger)
-	d.EventDispatcher(event)
-
-	timerEvent := &TimerEvent{
-		GameID:    "your_game_id",
-		PlayerID:  "your_player_id",
-		EventType: "timer_expired",
-		Timestamp: time.Now(),
-	}
-	time.AfterFunc(30*time.Second, func() {
-		d.EventDispatcher(timerEvent)
-	})
-
-	time.Sleep(5 * time.Second) // Allow some time for the handlers to process the messages
+	// Starts the command and event dispatchers's goroutines
+	d.Start(ctx)
 
 	// Close the Redis client
 	err = client.Close()
 	if err != nil {
-		errorLogger.ErrorLog("Error closing Redis client:", err)
+		errorLogger.ErrorLog(ctx, "Error closing Redis client:", zap.Error(err))
 	}
 }
 
@@ -207,33 +235,34 @@ func getRedisClient() (*redis.Client, error) {
 		DB:       0,  // Default DB
 	})
 
-	pong, err := client.Ping(context.Background()).Result()
-	fmt.Println(pong, err)
+	_, err := client.Ping(context.Background()).Result()
 
 	return client, err
 
 }
 
 // NewDispatcher creates a new Dispatcher instance.
-func NewDispatcher(client *redis.Client, errorLogger Logger) *Dispatcher {
-	dispatcher := &Dispatcher{
-		commandChan: make(chan interface{}),
-		eventChan:   make(chan interface{}),
-		client:      client,
-		errorLogger: errorLogger,
+func NewDispatcher(client *redis.Client, errorLogger Logger, eventCmdLogger Logger) *Dispatcher {
+	dispatch := &Dispatcher{
+		commandChan:    make(chan interface{}),
+		eventChan:      make(chan interface{}),
+		client:         client,
+		errorLogger:    errorLogger,
+		eventCmdLogger: eventCmdLogger,
 	}
 
+	//  the DONE chan controls the Dispatcher! closing it will stop the dispatcher and both pubsubs
 	done := make(chan struct{})
 
 	// Subscribe to Redis Pub/Sub channels for commands and events
-	dispatcher.subscribeToCommands(done)
-	dispatcher.subscribeToEvents(done)
+	dispatch.subscribeToCommands(done)
+	dispatch.subscribeToEvents(done)
 
-	return dispatcher
+	return dispatch
 
 }
 
-func (d *Dispatcher) initializeDb(eventCmdLogger Logger) {
+func (d *Dispatcher) initializeDb() error {
 	//a data source name is made that tells postgresql where to connect to
 	dsn := fmt.Sprintf(
 		"host=db user=%s password=%s dbname=%s port=5432 sslmode=disable TimeZone=America/New_York",
@@ -250,17 +279,24 @@ func (d *Dispatcher) initializeDb(eventCmdLogger Logger) {
 	})
 
 	if err != nil {
-		d.errorLogger.ErrorLog("Error connecting to database:", err)
-		return
+		return err
 	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		return err
+	}
+
+	sqlDB.SetMaxIdleConns(20)
+	sqlDB.SetMaxOpenConns(200)
 
 	// models.Player struct is automatically migrated to the database
 	db.AutoMigrate(&GameStateUpdate{})
 
-	eventCmdLogger.InfoLog("connected to database", nil)
-
 	// declare DB as a Dbinstance, and thus a global
 	DB = Dbinstance{Db: db}
+
+	return nil
 }
 
 //................................................//
@@ -269,10 +305,13 @@ func (d *Dispatcher) initializeDb(eventCmdLogger Logger) {
 
 type Event interface {
 	// ModifyPersistedDataTable will be used by events to persist data to the database.
-	ModifyPersistedDataTable() error
+	ModifyPersistedDataTable(ctx context.Context) error
+	MarshalEvt() ([]byte, error)
 }
 
-type Command interface{}
+type Command interface {
+	MarshalCmd() ([]byte, error)
+}
 
 type Dbinstance struct {
 	Db *gorm.DB
@@ -285,16 +324,24 @@ type GameStateUpdate struct {
 	GameID      string `gorm:"index"`
 	MoveCounter int
 	PlayerID    string `gorm:"index"`
-	XCoordinate string
-	YCoordinate int
+	xCoordinate string
+	yCoordinate int
 }
 
 // For OfficialMoveEvent
-func (e *OfficialMoveEvent) ModifyPersistedDataTable() error {
+func (e *OfficialMoveEvent) ModifyPersistedDataTable(ctx context.Context) error {
+	logger, ok := ctx.Value(errorLoggerKey{}).(Logger)
+	if !ok {
+		return fmt.Errorf("failed to get logger from context")
+	}
 
 	moveParts := strings.Split(e.MoveData, ".")
 	if len(moveParts) != 3 {
-		return fmt.Errorf("invalid moveData format")
+		logger.ErrorLog(ctx, "invalid moveData format, != 3 parts",
+			zap.String("gameID", e.GameID),
+			zap.String("moveData", e.MoveData),
+		)
+		return fmt.Errorf("invalid moveData format, != 3 parts")
 	}
 
 	moveCounter := moveParts[0]
@@ -309,27 +356,32 @@ func (e *OfficialMoveEvent) ModifyPersistedDataTable() error {
 		return err
 	}
 
-	YCoordinateInt, err := strconv.Atoi(yCoordinate)
+	yCoordinateInt, err := strconv.Atoi(yCoordinate)
 	if err != nil {
 		return err
 	}
 
-	GameStateUpdate := GameStateUpdate{
+	newUpdate := GameStateUpdate{
 		GameID:      e.GameID,
 		MoveCounter: moveCounterInt,
 		PlayerID:    playerID,
-		XCoordinate: xCoordinate,
-		YCoordinate: YCoordinateInt,
+		xCoordinate: xCoordinate,
+		yCoordinate: yCoordinateInt,
 	}
 
-	result := DB.Db.Create(&GameStateUpdate)
+	result := DB.Db.Create(&newUpdate)
 
 	if result.RowsAffected != 1 {
-		fmt.Println("number of rows affected by DB update was not 1, but instead %v", result.RowsAffected)
+		logger.ErrorLog(ctx, "number of rows affected by DB update was != 1",
+			zap.String("gameID", e.GameID),
+			zap.String("moveData", e.MoveData),
+			zap.Int64("rowsAffected", result.RowsAffected),
+		)
+		return fmt.Errorf("number of rows affected by DB update was != 1 ")
 	}
 
 	if result.Error != nil {
-		fmt.Println("failed to update DB", result.Error)
+		logger.ErrorLog(ctx, "failed to update DB", zap.Error(result.Error))
 		return result.Error
 	}
 
@@ -337,34 +389,30 @@ func (e *OfficialMoveEvent) ModifyPersistedDataTable() error {
 }
 
 // For GameEndsEvent
-func (e *GameEndsEvent) ModifyPersistedDataTable() error {
+func (e *GameEndsEvent) ModifyPersistedDataTable(ctx context.Context) error {
+	logger, ok := ctx.Value(errorLoggerKey{}).(Logger)
+	if !ok {
+		return fmt.Errorf("failed to get logger from context")
+	}
 
 	GameStateUpdate := &GameStateUpdate{
 		GameID:      e.GameID,
 		MoveCounter: -99,
 		PlayerID:    e.WinnerID + " WINS",
-		XCoordinate: e.WinCondition,
-		YCoordinate: 0,
+		xCoordinate: e.WinCondition,
+		yCoordinate: 0,
 	}
 
 	err := DB.Db.Create(GameStateUpdate).Error
 	if err != nil {
+		logger.ErrorLog(ctx, "failed to update DB",
+			zap.String("gameID", e.GameID),
+			zap.Error(err),
+		)
 		return err
 	}
 
 	return nil
-}
-
-// log the event or command in a generic way using reflection.
-func logEvent(event interface{}, logger Logger) {
-	eventType := reflect.TypeOf(event).Name()
-	logger.InfoLog("Received "+eventType, zap.Any("event", event))
-
-}
-
-func logCommand(cmd interface{}, logger Logger) {
-	cmdType := reflect.TypeOf(cmd).Name()
-	logger.InfoLog("Received "+cmdType, zap.Any("command", cmd))
 }
 
 //................................................//
@@ -372,9 +420,22 @@ func logCommand(cmd interface{}, logger Logger) {
 //................................................//
 
 // Start starts the command and event dispatchers.
-func (d *Dispatcher) Start() {
-	go d.commandDispatcher()
-	go d.eventDispatcher()
+func (d *Dispatcher) Start(ctx context.Context) {
+	errChan := make(chan error) // create an error channel
+
+	go d.commandDispatcher(ctx, errChan)
+	go d.eventDispatcher(ctx, errChan)
+
+	// Let's listen to our error channel now
+	go func() {
+		for err := range errChan {
+			// Log the error or handle it appropriately.
+			logger, ok := ctx.Value(errorLoggerKey{}).(Logger)
+			if ok {
+				logger.ErrorLog(ctx, "Error in dispatcher", zap.Error(err))
+			}
+		}
+	}()
 }
 
 // CommandDispatcher is FIRST STOP for a message in this channel - it dispatches the command to the appropriate channel.
@@ -382,18 +443,24 @@ func (d *Dispatcher) CommandDispatcher(cmd interface{}) {
 	d.commandChan <- cmd
 }
 
-func (d *Dispatcher) commandDispatcher() {
+func (d *Dispatcher) commandDispatcher(ctx context.Context, errChan chan<- error) {
+	logger, ok := ctx.Value(errorLoggerKey{}).(Logger)
+	if !ok {
+		errChan <- fmt.Errorf("failed to get logger from context in commandDispatcher")
+	}
+
 	for cmd := range d.commandChan {
 		payload, err := json.Marshal(cmd)
 		if err != nil {
-			d.errorLogger.ErrorLog("Error marshaling command", err)
-			continue
+			logger.ErrorLog(ctx, "Error marshaling command", zap.Error(err))
+			errChan <- err
 		}
 
 		// Publish command to Redis Pub/Sub channel
-		err = d.client.Publish(context.Background(), "commands", payload).Err()
+		err = d.client.Publish(ctx, "commands", payload).Err()
 		if err != nil {
-			d.errorLogger.ErrorLog("Error Publishing command", err)
+			logger.ErrorLog(ctx, "Error Publishing command", zap.Error(err))
+			errChan <- err
 		}
 	}
 }
@@ -403,25 +470,34 @@ func (d *Dispatcher) EventDispatcher(event interface{}) {
 	d.eventChan <- event
 }
 
-func (d *Dispatcher) eventDispatcher() {
+func (d *Dispatcher) eventDispatcher(ctx context.Context, errChan chan<- error) {
+	logger, ok := ctx.Value(errorLoggerKey{}).(Logger)
+	if !ok {
+		errChan <- fmt.Errorf("failed to get logger from context in eventDispatcher")
+	}
+
 	for event := range d.eventChan {
-		data, err := json.Marshal(event)
+
+		payload, err := json.Marshal(event)
 		if err != nil {
-			d.errorLogger.ErrorLog("Error marshaling event", err)
-			continue
+			logger.ErrorLog(ctx, "Error marshaling event (eventDispatcher)", zap.Error(err))
+			errChan <- err
 		}
 
 		// Publish event to Redis Pub/Sub channel
-		err = d.client.Publish(context.Background(), "events", data).Err()
+		err = d.client.Publish(ctx, "events", payload).Err()
 		if err != nil {
-			d.errorLogger.ErrorLog("Error Publishing event", err)
+			logger.ErrorLog(ctx, "Error Publishing event (eventDispatcher)", zap.Error(err))
+			errChan <- err
 		}
 	}
 }
 
 // Subscribe to commands and events with the done channel
-func (d *Dispatcher) subscribeToCommands(done <-chan struct{}) {
-	commandPubSub := d.client.Subscribe(context.Background(), "commands")
+// subscribeToCommands with error channel
+func (d *Dispatcher) subscribeToCommands(done <-chan struct{}, errChan chan<- error) {
+	ctx := context.Background()
+	commandPubSub := d.client.Subscribe(ctx, "commands")
 
 	// Command receiver/handler
 	go func() {
@@ -432,29 +508,40 @@ func (d *Dispatcher) subscribeToCommands(done <-chan struct{}) {
 				commandPubSub.Close()
 				return
 			case msg := <-cmdCh:
-				var cmd Command
 				cmdType, found := cmdTypeMap[msg.Channel]
 				if !found {
-					d.errorLogger.InfoLog("unknown command type", msg.Channel)
+					err := fmt.Errorf("unknown command type: %s", cmdType.(string))
+					d.errorLogger.InfoLog(ctx, "unknown command type", zap.String("cmdType", cmdType.(string)))
+					errChan <- err
 					continue
 				}
 
 				cmdValue := reflect.New(reflect.TypeOf(cmdType).Elem()).Interface()
 				err := json.Unmarshal([]byte(msg.Payload), &cmdValue)
 				if err != nil {
-					d.errorLogger.ErrorLog(fmt.Sprintf("Error unmarshaling %s: %v\n", msg.Channel), err)
+					err = fmt.Errorf("Error unmarshaling %s: %v\n", msg.Channel, err)
+					d.errorLogger.ErrorLog(ctx, err.Error(), zap.Error(err))
+					errChan <- err
 					continue
 				}
-
-				cmd = cmdValue
-				d.handleCommand(done, cmd, commandPubSub)
+				// Type assertion to ensure that the unmarshaled event implements the Command interface
+				cmdTypeAsserted, ok := cmdValue.(Command)
+				if !ok {
+					err := fmt.Errorf("unmarshaled command does not implement Event interface")
+					d.errorLogger.InfoLog(ctx, err.Error(), zap.Error(err))
+					errChan <- err
+					continue
+				}
+				d.handleCommand(done, cmdTypeAsserted, commandPubSub)
 			}
 		}
 	}()
 }
 
-func (d *Dispatcher) subscribeToEvents(done <-chan struct{}) {
-	eventPubSub := d.client.Subscribe(context.Background(), "events")
+// subscribeToEvents with error channel
+func (d *Dispatcher) subscribeToEvents(done <-chan struct{}, errChan chan<- error) {
+	ctx := context.Background()
+	eventPubSub := d.client.Subscribe(ctx, "events")
 	defer eventPubSub.Close()
 
 	// Event handler
@@ -466,26 +553,32 @@ func (d *Dispatcher) subscribeToEvents(done <-chan struct{}) {
 				eventPubSub.Close()
 				return
 			case msg := <-eventCh:
-				var event Event
 				eventType, found := eventTypeMap[msg.Channel]
 				if !found {
-					d.errorLogger.InfoLog("unknown event type", msg.Channel)
+					err := fmt.Errorf("unknown event type: %s", msg.Channel)
+					d.errorLogger.InfoLog(ctx, err.Error())
+					errChan <- err
 					continue
 				}
 
 				eventValue := reflect.New(reflect.TypeOf(eventType).Elem()).Interface()
 				err := json.Unmarshal([]byte(msg.Payload), &eventValue)
 				if err != nil {
-					d.errorLogger.ErrorLog(fmt.Sprintf("Error unmarshaling %s: %v\n", msg.Channel), err)
+					err = fmt.Errorf("Error unmarshaling %s: %v\n", msg.Channel, err)
+					d.errorLogger.ErrorLog(ctx, err.Error(), zap.Error(err))
+					errChan <- err
 					continue
 				}
-				event, ok := eventValue.(Event)
+				// Type assertion to ensure that the unmarshaled event implements the Event interface
+				evtTypeAsserted, ok := eventValue.(Event)
 				if !ok {
-					d.errorLogger.InfoLog("unmarshaled event does not implement Event interface", nil)
+					err := fmt.Errorf("unmarshaled event does not implement Event interface")
+					d.errorLogger.InfoLog(ctx, err.Error(), zap.Error(nil))
+					errChan <- err
 					continue
 				}
 
-				d.handleEvent(done, event, eventPubSub)
+				d.handleEvent(ctx, evtTypeAsserted, eventPubSub)
 			}
 		}
 	}()
@@ -506,90 +599,83 @@ func (d *Dispatcher) handleCommandWrapper(cmd interface{}) {
 }
 
 // Event Handler
-func (d *Dispatcher) handleEvent(done <-chan struct{}, event Event, eventPubSub *redis.PubSub) {
-	// define the context and cancel function for the countdown handler
-	var cancelChan = make(chan struct{})
+func (d *Dispatcher) handleEvent(ctx context.Context, done <-chan struct{}, event Event, eventPubSub *redis.PubSub) error {
+	// Create a new context for the countdown handler with a deadline.
+	ctxCountdown, cancelCountdown := context.WithTimeout(ctx, moveTimeout)
+	defer cancelCountdown()
+
+	// Create a channel to receive the signal to cancel the countdown handler.
+	cancelChan := make(chan struct{})
+	defer close(cancelChan)
 
 	switch event := event.(type) {
-
-	case *DeclaredMoveEvent:
-		// Handle declared move event
-		fmt.Println("Received DeclaredMoveEvent:", event)
 	case *InvalidMoveEvent:
-
-		// Handle invalid move event
-		fmt.Println("Received InvalidMoveEvent:", event)
-
+		d.errorLogger.Warn(ctx, "Received InvalidMoveEvent: %v", event)
 	case *OfficialMoveEvent:
-		// stop the timer as soon as this signal is received to prevent the timer from expiring when it shouldn't
-		cancelChan <- struct{}{}
+		d.eventCmdLogger.Info(ctx, event.GameID+"/"+event.PlayerID+" has made a move: "+event.MoveData)
 
 		// Persist the accepted move to a database
-		err := event.ModifyPersistedDataTable()
-		if err != nil {
-			fmt.Println("Error persisting official move:", err)
+		if err := event.ModifyPersistedDataTable(ctx); err != nil {
+			return fmt.Errorf("error persisting official move: %w", err)
 		}
-
-		// Create a new context for the countdown handler.
-		ctx, cancel := context.WithCancel(context.Background())
 
 		// Start the countdown handler as a goroutine.
 		go func() {
-			err := CountdownHandler(ctx, event)
-			if err != nil {
-				fmt.Println("Error handling event:", err)
+			timer := time.NewTimer(moveTimeout)
+
+			if err := CountdownHandler(ctxCountdown, event, timer); err != nil {
+				d.errorLogger.Error(ctx, "Error handling event: %v", err)
 			}
-		}()
-
-		// Create a channel to receive the signal to cancel the countdown handler.
-		cancelChan := make(chan struct{})
-
-		// Start a goroutine to wait for the cancel signal and then cancel the countdown handler.
-		go func() {
-			// Wait for the cancel signal from another goroutine, e.g., the move handler.
-			<-cancelChan
-
 			// Cancel the context, which will stop the countdown handler.
-			cancel()
+			cancelChan <- struct{}{}
 		}()
 
 	case *GameEndsEvent:
+		d.eventCmdLogger.Info(ctx, event.GameID+"/"+event.PlayerID+" has made a game ending Move!: "+event.MoveData)
 
-		// Handle game ends event
-		fmt.Println("Received GameEndsEvent:", event)
+		// ends the timer !
+		cancelChan <- struct{}{}
 
 		// Persist the game end to a database
 		err := event.ModifyPersistedDataTable()
 		if err != nil {
-			fmt.Println("Error persisting games end move:", err)
+			d.errorLogger.Error(ctx, "Error persisting games end move: %v", err)
 		}
-
 		eventPubSub.Close()
 
 	case *TimerEvent:
+		d.eventCmdLogger.Info(ctx, "Received TimerEvent: %v", event)
 
-		// Handle timer event
-		fmt.Println("Received TimerEvent:", event)
+		timeNow := time.Now()
+		timeElapsed := timeNow.Sub(event.Timestamp)
+		if timeElapsed < time.Second*35 {
+			d.errorLogger.Error(ctx, "timer expired prematurely after %v seconds", timeElapsed.Seconds())
+		}
+
+		newCmd := &PlayerForfeitingCmd{
+			GameID:         event.GameID,
+			SourcePlayerID: event.PlayerID,
+			Timestamp:      event.Timestamp,
+			Reason:         fmt.Sprintf("Timer:%v", timeElapsed),
+		}
+
+		d.CommandDispatcher(newCmd)
 
 	default:
-		d.errorLogger.Error("Unknown event type", nil, watermill.LogFields{"event": event})
-
-		fmt.Println("Unknown event type")
+		d.errorLogger.Error(ctx, "Unknown event type: %v", fmt.Errorf("Weird event type: %T", event))
+		d.eventCmdLogger.Info(ctx, "Received Unusual, unknown event: %v", event)
 	}
+	return nil
 }
 
-// CountdownHandler is the event handler that starts a countdown clock when a valid move is published.
-func CountdownHandler(ctx context.Context, event Event) error {
-	fmt.Printf("Received move from Player %s: %s\n", event.PlayerID, event.MoveData)
-
-	// Start the 30-second countdown clock.
-	timer := time.NewTimer(moveTimeout)
+func CountdownHandler(ctx context.Context, event Event, timer *time.Timer) error {
 
 	// Wait for either the countdown to expire or a new move event.
 	select {
 	case <-timer.C:
 		fmt.Printf("Player %s has exceeded the time limit and forfeits the game.\n", event.PlayerID)
 		// Perform actions for game-ending event due to timeout.
+		return fmt.Errorf("Player %s has exceeded the time limit and forfeits the game", event.PlayerID)
 
 	case <-ctx.Done():
 		// The context is canceled if a new move event is received.
@@ -601,86 +687,10 @@ func CountdownHandler(ctx context.Context, event Event) error {
 	return nil
 }
 
-//................................................//
-//................................................//
-
-type AcceptedMoves struct {
-	list map[int]string // key is 1, 2, 3, 4,... Value is "a1", "b2", "h1", etc.
-}
-
-// populateAcceptedMoves_fromDB fetches data from the PostgreSQL database and populates the AcceptedMoves struct.
-func (d *Dispatcher) populateAcceptedMoves_fromDB(gameID string) (*AcceptedMoves, error) {
-
-	var gameStateUpdates []GameStateUpdate
-	acceptedMoves := AcceptedMoves{
-		list: make(map[int]string),
-	}
-
-	// Step 1: Sort by gameID and extract relevant columns
-	if err := DB.Db.Table("game_state_updates").
-		Select("move_counter, x_coordinate, y_coordinate").
-		Where("game_id = ?", gameID).
-		Order("move_counter").
-		Find(&gameStateUpdates).Error; err != nil {
-		return nil, err
-	}
-
-	// Process the result to create the AcceptedMoves map
-	for _, update := range gameStateUpdates {
-		// Convert YCoordinate to a string and concatenate XCoordinate and YCoordinate to form the map's value
-		yCoordinateStr := strconv.Itoa(update.YCoordinate)
-		concatenatedMoveData := update.XCoordinate + yCoordinateStr
-
-		// Use moveCounter as the key
-		acceptedMoves.list[update.MoveCounter] = concatenatedMoveData
-	}
-
-	return &acceptedMoves, nil
-}
-
-// populateAcceptedMoves_fromCache fetches data from the Redis cache and populates the AcceptedMoves struct.
-func (d *Dispatcher) populateAcceptedMoves_fromCache(gameID string) (*AcceptedMoves, error) {
-
-	moveList := make(map[string]string)
-	moveList, err := d.client.HGetAll(context.Background(), gameID).Result()
-	if err != nil {
-		d.errorLogger.ErrorLog("error extracting cache, resorting to use of DB", err)
-		return d.populateAcceptedMoves_fromDB(gameID)
-	}
-
-	// Convert the result to a Go map
-	allMoves := make(map[int]string, len(moveList))
-
-	// convert string to int
-	for field, value := range moveList {
-		f, err := strconv.Atoi(field)
-		if err != nil {
-			d.errorLogger.ErrorLog("error converting cache hash to Go map", err)
-			return d.populateAcceptedMoves_fromDB(gameID)
-		}
-		allMoves[f] = value
-	}
-
-	acceptedMoves := AcceptedMoves{
-		list: allMoves,
-	}
-
-	return &acceptedMoves, nil
-}
-
-func reverseMap(m map[int]string) map[string]int {
-	n := make(map[string]int, len(m))
-	for k, v := range m {
-		n[v] = k
-	}
-	return n
-}
-
-// Function to handle the command and validate the move
 func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPubSub *redis.PubSub) {
 	switch cmd := cmd.(type) {
 	case *DeclaringMoveCmd:
-		key := "acceptedMoveList"
+		key := "acceptedMoveList" // key is for accessing the cache
 
 		numCache, err := d.getCacheSize(key)
 		if err != nil {
@@ -723,63 +733,296 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 			}
 		}
 
-		newCmd := &EvaluatingMoveValidityCmd{
-			ID:             uuid.New().String(),
-			GameID:         cmd.GameID,
-			SourcePlayerID: cmd.SourcePlayerID,
-			DeclaredMove:   cmd.DeclaredMove,
-			ValidMove:      validMove,
-			Timestamp:      time.Now(),
+		if !validMove {
+			newEvent := &InvalidMoveEvent{
+				GameID:      cmd.GameID,
+				PlayerID:    cmd.SourcePlayerID,
+				InvalidMove: cmd.DeclaredMove,
+			}
+			d.EventDispatcher(newEvent)
+
+		} else {
+			newEvent := &OfficialMoveEvent{
+				GameID:    cmd.GameID,
+				PlayerID:  cmd.SourcePlayerID,
+				MoveData:  cmd.DeclaredMove,
+				Timestamp: time.Now(),
+			}
+			d.EventDispatcher(newEvent)
 		}
 
-		d.commandChan <- newCmd
+	case *LetsStartTheGameCmd:
 
-	case *PublishingMoveCmd:
-		// Handle PublishMove command
-		fmt.Println("Received PublishingMoveCmd:", cmd)
-	case *StartingGameCmd:
-		// Handle StartGame command
-		fmt.Println("Received StartingGameCmd:", cmd)
-	case *EvaluatingMoveValidityCmd:
-		// Handle EvaluateMoveValidity command
-		fmt.Println("Received EvaluatingMoveValidityCmd:", cmd)
+		// Create a new channel for this game instance
+		gameID := cmd.GameID
 
-	case *PlayerForfeitingCmd:
-		// Handle Player Forfeiting command
-		fmt.Println("Received PlayerForfeitingCmd:", cmd)
-	case *UpdatingGameStateUpdateCmd:
-		// Handle Update Game State command
-		fmt.Println("Received UpdatingGameStateUpdateCmd:", cmd)
+		// Check if the game is still locked (not claimed by another goroutine)
+		lockMutex.Lock()
+		lockedGame, ok := lockedGames[gameID]
+		delete(lockedGames, gameID) // Remove the game from the map
+		lockMutex.Unlock()
 
-	default:
-		d.errorLogger.ErrorLog(fmt.Sprintf("Unknown command type %w", cmd), nil)
+		if !ok {
+			// The game was claimed by another goroutine, abort this instance
+			return
+		}
 
-		fmt.Println("Unknown command type")
+		// Announce the game with the locked players in a new goroutine
+		go lockGame(d, lockedGame)
+		acked := checkForPlayerAck(cmd, lockedGame)
+		if acked == false {
+			return
+		} else {
+			startEvent := &GameStartEvent{
+				GameID:         lockedGame.GameID,
+				FirstPlayerID:  lockedGame.Player1.ID,
+				SecondPlayerID: lockedGame.Player2.ID,
+				Timestamp:      time.Now(),
+			}
+
+			d.EventDispatcher(startEvent)
+		}
+
 	}
 }
 
-func (d *Dispatcher) getCacheSize(key string) (int, error) {
-
-	//numElements, err := d.client.HLen(context.Background(), key).Result()
-	allKeys, err := (d.client.HKeys(context.Background(), key)).Result()
-	if err != nil {
-		d.errorLogger.ErrorLog("error querying caches key list", err)
-		return -1, nil
+func reverseMap(m map[int]string) map[string]int {
+	n := make(map[string]int, len(m))
+	for k, v := range m {
+		n[v] = k
 	}
+	return n
+}
 
-	numElements := len(allKeys)
-	maxCounter := 0
-	for p := range allKeys {
-		pp, _ := strconv.Atoi(allKeys[p])
-		if pp > maxCounter {
-			maxCounter = pp
+func checkForPlayerAck(cmd *LetsStartTheGameCmd, lockedGame LockedGame) bool {
+	acked := false
+
+	// Wait for player1's acknowledgement
+	time.Sleep(5 * time.Second)
+	if isGameAcknowledged(cmd.GameID, lockedGame.Player1.PlayerID) {
+		// Player1 acknowledged, proceed to wait for player2's acknowledgement
+		time.Sleep(5 * time.Second)
+		if isGameAcknowledged(cmd.GameID, lockedGame.Player2.PlayerID) {
+			acked = true
 		}
 	}
-
-	if int(numElements) != maxCounter {
-		d.errorLogger.ErrorLog("error querying cache", fmt.Errorf("numElements != maxMoveCounter"))
-		return -1, nil
+	if acked == false {
+		lockMutex.Lock()
+		delete(lockedGames, cmd.GameID) // Remove the game from the map
+		lockMutex.Unlock()
 	}
 
-	return maxCounter, nil
+	return acked
+}
+
+// NewWorker function with WorkerID assignment
+func NewWorker() *Worker {
+	// Generate a unique worker ID (e.g., using UUID)
+	workerID := uuid.New().String()
+
+	return &Worker{
+		WorkerID:      workerID,
+		PlayerChan:    make(chan PlayerIdentity),
+		ReleasePlayer: make(chan string), // Initialize the broadcast channel
+	}
+}
+
+// Define the acknowledgment map and mutex
+var (
+	acknowledgments = make(map[string][]string)
+	ackMutex        = sync.Mutex{}
+)
+
+// Function to check if both players have acknowledged the game
+func isGameAcknowledged(gameID, playerID string) bool {
+	ackMutex.Lock()
+	defer ackMutex.Unlock()
+
+	// Check if the game is already in the acknowledgment map
+	if acks, ok := acknowledgments[gameID]; ok {
+		// Check if the player is not already in the acknowledgments
+		for _, ackPlayerID := range acks {
+			if ackPlayerID == playerID {
+				// Player already acknowledged the game
+				return true
+			}
+		}
+
+		// Add the player to the acknowledgments for this game
+		acknowledgments[gameID] = append(acks, playerID)
+
+		// Check if both players have acknowledged the game
+		if len(acknowledgments[gameID]) == 2 {
+			// If both players acknowledged, delete the game entry from the map
+			delete(acknowledgments, gameID)
+			return true
+		}
+	} else {
+		// If the game is not in the acknowledgments, create a new entry for it
+		acknowledgments[gameID] = []string{playerID}
+	}
+
+	return false
+}
+
+func lockGame(d *Dispatcher, lockedGame LockedGame) {
+
+	// Lock the game with the two players in the shared map
+	lockMutex.Lock()
+	_, ok := lockedGames[lockedGame.GameID]
+	if !ok {
+		lockedGames[lockedGame.GameID] = lockedGame
+	}
+	lockMutex.Unlock()
+
+	// Check if the game is still locked (not claimed by another goroutine)
+	if !ok {
+		// The game was claimed by another goroutine, abort this instance
+		return
+	}
+
+	// Wait for player1+2's acknowledgement
+	time.Sleep(5 * time.Second)
+	if isGameAcknowledged(lockedGame.GameID, lockedGame.Player1.PlayerID) {
+		time.Sleep(5 * time.Second)
+		if isGameAcknowledged(lockedGame.GameID, lockedGame.Player2.PlayerID) {
+			// both acknowledged, start the game
+
+			newEvent := &LetsStartTheGameCmd{
+				GameID:    lockedGame.GameID,
+				Player1:   lockedGame.Player1.PlayerID,
+				Player2:   lockedGame.Player2.PlayerID,
+				Timestamp: time.Now(),
+			}
+			d.EventDispatcher(newEvent)
+
+			return
+		}
+	}
+	// Player1 didn't acknowledge, abort the game
+	lockMutex.Lock()
+	delete(lockedGames, lockedGame.GameID) // Remove the game from the map
+	lockMutex.Unlock()
+	return
+}
+
+func (w *Worker) Run(d *Dispatcher) {
+	for { // this is an infinite loop to continuously handle incoming players and games.
+		// Listen for incoming player identities
+		player1 := <-w.PlayerChan
+		player2 := <-w.PlayerChan
+
+		w.GameID = uuid.New().String() // Generate a unique game ID (e.g., using UUID)
+
+		// Randomize player order with rand.Shuffle
+		players := [2]PlayerIdentity{player1, player2}
+		rand.Shuffle(2, func(i, j int) { players[i], players[j] = players[j], players[i] })
+
+		// Lock the game with the two players in a shared map
+		lockGame(d, LockedGame{
+			GameID:   w.GameID,
+			WorkerID: w.WorkerID,
+			Player1:  players[0],
+			Player2:  players[1],
+		})
+
+		// Wait for the release notification
+		select {
+		case playerID := <-w.ReleasePlayer:
+			// Release the player if it matches any of the announced players
+			if players[0].PlayerID == playerID || players[1].PlayerID == playerID {
+				// Release the player and proceed to the next iteration
+				continue
+			}
+		}
+	}
+}
+
+func (d *Dispatcher) StartWorkerPool(numWorkers int) {
+	// Create a new channel to announce games
+	announceGameChan := make(chan *GameAnnouncementEvent)
+
+	// Create and start a pool of workers
+	workers := make([]*Worker, numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		workers[i] = NewWorker()
+		go workers[i].Run(d)
+	}
+
+	// players join  game chanvia the fronmt ewnd
+	var gameChannel = make(chan PlayerIdentity)
+	var playerCount int     // Counter to keep track of the number of players joined
+	var lastWorkerIndex int // Keep track of the index of the last assigned worker
+
+	lastWorkerIndex = 0
+	playerCount = 0
+
+	go func() {
+		for {
+			select {
+			case player := <-gameChannel:
+				// Use round-robin to select the next worker
+				lastWorkerIndex = (lastWorkerIndex + 1) % numWorkers
+				workers[lastWorkerIndex].PlayerChan <- player
+
+				playerCount++
+				if playerCount == 2 {
+					// Close the channel to indicate that no more players should be added
+					close(gameChannel)
+
+					// the worker knows the gameID because it was set during "Run" function
+					gameID := workers[lastWorkerIndex].GameID
+					workerID := workers[lastWorkerIndex].WorkerID
+
+					// Create a new channel to wait for player acknowledgements
+					ackChannel := make(chan bool)
+
+					// Announce the game with the locked players in a new goroutine
+					go lockGame(d, gameID, workers[lastWorkerIndex].Player1, workers[lastWorkerIndex].Player2, ackChannel)
+
+					// Wait for player acknowledgements
+					for i := 0; i < 2; i++ {
+						select {
+						case <-ackChannel:
+							// Player acknowledged, continue waiting for the other player
+						case <-time.After(5 * time.Second):
+							// Timeout if a player doesn't send acknowledgement within 5 seconds
+							d.errorLogger.InfoLog("Timeout: Player didn't send acknowledgement within 5 seconds.")
+							return
+						}
+					}
+
+					// Both players acknowledged, start the game
+
+					// send command to start the game!?!
+
+				}
+			case <-time.After(15 * time.Second):
+				// Timeout if the second player doesn't send identity within 15 seconds.
+				d.errorLogger.InfoLog("Timeout: Second player didn't send identity within 15 seconds.")
+				close(gameChannel) // Close the channel to stop waiting for more players
+				return
+			}
+		}
+	}()
+
+	go func() {
+		for {
+			select {
+			case announceEvent := <-announceGameChan:
+				// Announce the game with the locked players
+				d.EventDispatcher(announceEvent)
+
+				// Notify all workers to release players that match the announced game's players
+				for _, w := range workers {
+					select {
+					case w.ReleasePlayer <- announceEvent.FirstPlayerID:
+					case w.ReleasePlayer <- announceEvent.SecondPlayerID:
+					default:
+						// If the worker's broadcast channel is busy, skip and proceed to the next worker
+					}
+				}
+			}
+		}
+	}()
 }

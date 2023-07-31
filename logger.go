@@ -46,9 +46,6 @@ func initLogger(logFilePath string, level gormlogger.LogLevel) Logger {
 
 	logger := zap.New(core, zap.AddCaller(), zap.AddCallerSkip(1))
 
-	defer logger.Sync()
-	logger.Info("constructed a logger")
-
 	return Logger{
 		ZapLogger:     logger,
 		LogLevel:      level,
@@ -70,7 +67,7 @@ func (l Logger) Info(ctx context.Context, str string, args ...interface{}) {
 	if l.LogLevel < gormlogger.Info {
 		return
 	}
-	l.logger(ctx).Debug(fmt.Sprintf(str, args...))
+	l.logger(ctx).Info(fmt.Sprintf(str, args...))
 }
 
 func (l Logger) Warn(ctx context.Context, str string, args ...interface{}) {
@@ -115,14 +112,13 @@ func (l Logger) logger(ctx context.Context) *zap.Logger {
 	return logger
 }
 
-func (logger *Logger) ErrorLog(msg string, err error) {
-	ctx := context.WithValue(context.Background(), "error", err)
-	logger.Error(ctx, msg)
-	fmt.Println(msg, err)
+func (logger *Logger) ErrorLog(ctx context.Context, msg string, fields ...zapcore.Field) {
+	logger.ZapLogger.Error(msg, fields...)
 }
 
-func (logger *Logger) InfoLog(msg string, args ...interface{}) {
-	ctx := context.WithValue(context.Background(), "args", args)
-	logger.Info(ctx, msg)
-	fmt.Println(msg, args)
+func (logger *Logger) InfoLog(ctx context.Context, msg string, fields ...zapcore.Field) {
+	logger.ZapLogger.Info(msg, fields...)
 }
+
+// e.g. logger.Info(context.Background(), "User %s with id %d logged in.", "alice", 123)
+// OR : logger.InfoLog(context.Background(), "User login", zap.String("user", "alice"), zap.Int("id", 123))

@@ -1,60 +1,52 @@
 package main
 
-import(
+import (
 	"fmt"
 	"time"
-
 )
 
 type TimerControl struct {
-    startChan chan struct{}
-    stopChan  chan struct{}
+	startChan chan struct{}
+	stopChan  chan struct{}
 }
 
-func NewTimerControl() *TimerControl {
-    return &TimerControl{
-        startChan: make(chan struct{}),
-        stopChan:  make(chan struct{}),
-    }
-}
+func MakeNewTimer() *TimerControl {
+	tc := &TimerControl{
+		startChan: make(chan struct{}),
+		stopChan:  make(chan struct{}),
+	}
 
-func (tc *TimerControl) StartTimer(d *Dispatcher, string, nextMoveNumber int, gameID string) {
-    var nextPlayerID string
-	if nextMoveNumber%2 == 1 {
-		nextPlayerID = "P1"
-	} else {
-		nextPlayerID = "P2"
-	}
-	newCmd := &StartNextTurnCmd{
-		GameID: gameID,
-		nextMoveNumber: nextMoveNumber,
-		nextPlayerID: nextPlayerID,
-		starttime: time.Now(),
-	}
-	d.commandDispatcher.Dispatch(ctx, newCmd)
-    tc.startChan <- struct{}{}
+	go tc.ManageTimer()
+
+	return tc
 }
 
 func (tc *TimerControl) StopTimer() {
-    tc.stopChan <- struct{}{}
+	tc.stopChan <- struct{}{}
+}
+
+func (tc *TimerControl) StartTimer() {
+	tc.startChan <- struct{}{}
 }
 
 func (tc *TimerControl) ManageTimer() {
-    for {
-        select {
-        case <-tc.startChan:
-            go func() {
-                select {
-                case <-time.After(30 * time.Second):
-                    fmt.Println("Forfeit Event Cascade")
-                case <-tc.stopChan:
-                    fmt.Println("Next Turn")
-                }
-            }()
-        }
-    }
+	var timer *time.Timer
+	for {
+		select {
+		case <-tc.startChan:
+			if timer != nil {
+				timer.Stop()
+			}
+			timer = time.NewTimer(30 * time.Second)
+		case <-tc.stopChan:
+			if timer != nil {
+				timer.Stop()
+				fmt.Println("Turn Complete")
+			}
+		case <-timer.C:
+			if timer != nil {
+				fmt.Println("Forfeit Event Cascade")
+			}
+		}
+	}
 }
-
-
-
-

@@ -94,7 +94,7 @@ type GameStateUpdate struct {
 	xCoordinate string
 	yCoordinate int
 }
-
+\
 type AcceptedMoves struct {
 	list map[int]string
 }
@@ -132,10 +132,17 @@ type DeclaringMoveCmd struct {
 	Timestamp      time.Time `json:"timestamp"`
 }
 
+type CheckForWinConditionCmd struct {
+	Command
+	GameID	string    `json:"gameId"`
+	MoveCount int    `json:"moveCount"`
+	PlayerID string    `json:"playerId"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
 type StartNextTurnCmd struct {
 	Command
 	gameID         string
-	nextMoveNumber int
 	nextPlayerID   string
 	Timestamp      time.Time
 }
@@ -144,6 +151,7 @@ type StartNextTurnCmd struct {
 type LetsStartTheGameCmd struct {
 	Command
 	GameID    string    `json:"gameId"`
+	NextMoveNumber int  `json:"nextMoveNumber"`
 	Player1   string    `json:"player1"`
 	Player2   string    `json:"player2"`
 	Timestamp time.Time `json:"timestamp"`
@@ -212,6 +220,7 @@ type Dispatcher struct {
 	commandHandlers map[string]func(interface{})
 	eventHandlers   map[string]func(interface{})
 	persister       *GameStatePersister
+	timer	*TimerControl
 }
 
 type Worker struct {
@@ -315,19 +324,21 @@ func (d *Dispatcher) handleEvent(ctx context.Context, done <-chan struct{}, even
 	case *OfficialMoveEvent:
 		d.eventCmdLogger.Info(ctx, event.GameID+"/"+event.PlayerID+" has made a move: "+event.MoveData)
 
-		// To get here means the player's move was valid! Therefore, we can cancel their countdown. we will start new one after processing this move
+		// To get here means the player's move was valid! Therefore, we can stop their countdown. we will start new one after processing this move
 
 		// This will parse the new move and then publish another message to the event bus that will be picked up by persisting logic and the win condition logic
-		newEvt, err := d.parseOfficialMoveEvt(ctx, event)
+		newEvt, err := d.WrappedHandlerforEachlMoveEvent(ctx, event)
 		if err != nil {
 			d.errorLogger.ErrorLog(ctx, "error extracting vmove data", zap.Error(err))
 		}
 		d.EventDispatcher(newEvt)
 
 	case *GameEndsEvent:
-		d.eventCmdLogger.Info(ctx, event.GameID+"/"+event.PlayerID+" has made a game ending Move!: "+event.MoveData)
+		// end the timer !
+		d.timer.StopTimer()
 
-		// ends the timer !
+		d.eventCmdLogger.Info(ctx, event.GameID +" is over", zap.String("Winner", event.WinnerID), zap.String("Loser", event.LoserID), zap.String("WinCondition", event.WinCondition))
+
 
 		// Persist the game end to a database
 		err := event.ModifyPersistedDataTable()
@@ -336,28 +347,28 @@ func (d *Dispatcher) handleEvent(ctx context.Context, done <-chan struct{}, even
 		}
 		eventPubSub.Close()
 
-		//???  case *TimerEvent:
-		d.eventCmdLogger.Info(ctx, "Received TimerEvent: %v", event)
 
-	case *startTurnEvent:
-		//ascertain what number move it is somehow
-		timer1 := NewTimerControl()
-		go timer1.ManageTimer() // runs an infinite loop
+		//??
+	    // case *TimerEvent:
+		//d.eventCmdLogger.Info(ctx, "Received TimerEvent: %v", event)
 
-		nextMoveNumber := event.MoveNumber + 1
-		timer1.StartTimer(d, nextMoveNumber, nextMoveNumber, event.GameID) // this prints the timestamp and all info to the command bus
 
 	case *GameStateUpdate:
 		// Persist the data and check win conditions
 		err := d.persister.PersistMove(event.MoveData)
 		if err != nil {
-			d.errorLogger.ErrorLog(ctx, "Error rbupdating game state: %v", zap.Error(err))
+			d.errorLogger.ErrorLog(ctx, "Error updating game state persistence: %v", zap.Error(err))
 		}
 
-		// Check for win conditions
-
-		// announce either game over or start timer for next player
-
+		newCmd := &CheckForWinConditionCmd{
+			GameID: event.GameID,
+			MoveCount: event.MoveCounter,
+			PlayerID: event.PlayerID,
+			Timestamp: time.Now(),
+		}
+		
+		d.CommandDispatcher(newCmd)
+ 
 	default:
 		d.errorLogger.Error(ctx, "Unknown event type: %v", fmt.Errorf("Weird event type: %T", event))
 		d.eventCmdLogger.Info(ctx, "Received Unusual, unknown event: %v", event)
@@ -367,33 +378,13 @@ func (d *Dispatcher) handleEvent(ctx context.Context, done <-chan struct{}, even
 
 func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPubSub *redis.PubSub) {
 
-	// You can now call d.gameState.GetMoveList() or d.gameState.UpdateMove() without caring about which database you're using.
 
 	switch cmd := cmd.(type) {
 	case *DeclaringMoveCmd:
 		ctx := context.Background()
-		key := "acceptedMoveList" // key is for accessing the cache
+		//key := "acceptedMoveList" // key is for accessing the cache
 
-		numCache, err := d.getCacheSize(key)
-		if err != nil {
-			d.errorLogger.ErrorLog(ctx, "error querying cache", zap.Error(err))
-		}
-
-		var acceptedMoves *AcceptedMoves
-
-		if numCache >= 0 {
-			// then we can use the cache!
-			acceptedMoves, err = d.populateAcceptedMoves_fromCache(cmd.GameID)
-			if err != nil {
-				d.errorLogger.ErrorLog(ctx, "error fetching accepted Move list! ", zap.Error(err))
-			}
-		} else if numCache < 0 { // cache is no good, use the DB
-			acceptedMoves, err := d.populateAcceptedMoves_fromDB(cmd.GameID)
-			if err != nil {
-				d.errorLogger.ErrorLog(ctx, "error fetching accepted Move list! ", zap.Error(err))
-			}
-			d.client.HSet(context.Background(), key, acceptedMoves.list)
-		}
+		acceptedMoves := d.persister.FetchGS(cmd.GameID)
 
 		// extract the moveData from the command
 		moveData := cmd.DeclaredMove
@@ -451,19 +442,24 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 		}
 
 		// Announce the game with the locked players in a new goroutine
-		go lockGame(d, lockedGame)
-		acked := checkForPlayerAck(cmd, lockedGame)
+		go lockGame(d, lg)
+		acked := checkForPlayerAck(cmd, lg)
 		if acked == false {
 			return
 		} else {
 			startEvent := &GameStartEvent{
-				GameID:         lockedGame.GameID,
-				FirstPlayerID:  lockedGame.Player1.ID,
-				SecondPlayerID: lockedGame.Player2.ID,
+				GameID:         lg.GameID,
+				FirstPlayerID:  lg.Player1.ID,
+				SecondPlayerID: lg.Player2.ID,
+				NextMoveNumber: 1,
 				Timestamp:      time.Now(),
 			}
 
 			d.EventDispatcher(startEvent)
+
+			d.timer = MakeNewTimer()
+			d.timer.startChan <- struct{}{}
+
 		}
 
 	}
@@ -511,7 +507,7 @@ func (d *Dispatcher) parseOfficialMoveEvt(ctx context.Context, e *OfficialMoveEv
 	return update, nil
 }
 
-func (d *Dispatcher) OfficialMoveEvent_Handler(ctx context.Context, evt *OfficialMoveEvent) *GameStateUpdate {
+func (d *Dispatcher) WrappedHandlerforEachlMoveEvent(ctx context.Context, evt *OfficialMoveEvent) *GameStateUpdate {
 
 	newEvt, err := d.parseOfficialMoveEvt(ctx, evt)
 	if err != nil {

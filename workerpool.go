@@ -1,54 +1,40 @@
 package main
 
 import (
-	"context"
-	"math/rand"
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	zap "go.uber.org/zap"
 )
 
 var allLockedGames = make(map[string]LockedGame)
 
-func checkForPlayerAck(cmd *LetsStartTheGameCmd, lg LockedGame) bool {
-	acked := false
+func GenerateUniqueGameID(db *PostgresGameState, w *Worker) (string, error) {
+	var gameID string
+	for {
+		gameID = fmt.Sprintf("%s-%s", uuid.New().String(), w.WorkerID)
 
-	// Wait for player1's acknowledgement
-	time.Sleep(5 * time.Second)
-	if isGameAcknowledged(cmd.GameID, lg.Player1.PlayerID) {
-		// Player1 acknowledged, proceed to wait for player2's acknowledgement
-		time.Sleep(5 * time.Second)
-		if isGameAcknowledged(cmd.GameID, lg.Player2.PlayerID) {
-			acked = true
+		var count int64
+		if err := db.DB.Model(&GameStateUpdate{}).Where("game_id = ?", gameID).Count(&count).Error; err != nil {
+			return "", fmt.Errorf("failed to check for existing gameID: %w", err)
 		}
-	}
 
-	if acked == false {
-		Delete(cmd.GameID)
-	}
+		if count == 0 {
+			// Found an unused gameID, break the loop
+			break
+		}
 
-	return acked
+		// Add a delay for DB overload
+		time.Sleep(time.Millisecond * 100)
+	}
+	return gameID, nil
 }
 
 func Delete(gameID string) {
 	lockMutex.Lock()
 	delete(allLockedGames, gameID) // Remove the game from the map
 	lockMutex.Unlock()
-}
-
-// NewWorker function with WorkerID assignment
-func NewWorker() *Worker {
-
-	// Generate a unique worker ID (e.g., using UUID)
-	workerID := uuid.New().String()
-
-	return &Worker{
-		WorkerID:    workerID,
-		PlayerChan:  make(chan PlayerIdentity),
-		ReleaseChan: make(chan string), // Initialize the broadcast channel
-	}
 }
 
 // Define the acknowledgment map and mutex
@@ -89,22 +75,16 @@ func isGameAcknowledged(gameID, playerID string) bool {
 	return false
 }
 
-func lockGame(d *Dispatcher, lg LockedGame) {
+func LockTheGame(d *Dispatcher, lg LockedGame) {
 	gameID := lg.GameID
 
 	lockMutex.Lock()
-	_, ok := lg[gameID]
+	_, ok := allLockedGames[gameID]
 	// add to map if not already there
 	if !ok {
 		allLockedGames[gameID] = lg
 	}
 	lockMutex.Unlock()
-
-	// Check if the game is still locked (not claimed by another goroutine)
-	if !ok {
-		// The game was claimed by another goroutine, abort this instance
-		return
-	}
 
 	P1 := lg.Player1.PlayerID
 	P2 := lg.Player2.PlayerID
@@ -133,138 +113,92 @@ func lockGame(d *Dispatcher, lg LockedGame) {
 	return
 }
 
-func (w *Worker) Run(d *Dispatcher) {
-	for { // this is an infinite loop to continuously handle incoming players and games.
-		// Listen for incoming player identities
+func NewWorker(workerID string) *Worker {
+	return &Worker{
+		GameID:      "",
+		WorkerID:    workerID,
+		PlayerChan:  make(chan PlayerIdentity, 2),
+		ReleaseChan: make(chan string),
+	}
+}
+
+func (w *Worker) WorkerRun(d *Dispatcher) {
+	for {
 		player1 := <-w.PlayerChan
 		player2 := <-w.PlayerChan
 
-		w.GameID = uuid.New().String() // Generate a unique WORKER ID (e.g., using UUID)
+		// Generate a unique game ID
+		gameID, err := GenerateUniqueGameID(d.persister.postgres, w)
+		if err != nil {
+			// Handle the error here
+			continue
+		}
+		w.GameID = gameID
 
-		// Randomize player order with rand.Shuffle
-		players := [2]PlayerIdentity{player1, player2}
-		rand.Shuffle(2, func(i, j int) { players[i], players[j] = players[j], players[i] })
-
-		// Lock the game with the two players in a shared map
-		lockGame(d, LockedGame{
-			GameID:   w.GameID,
+		// Lock the game
+		lg := LockedGame{
+			GameID:   gameID,
 			WorkerID: w.WorkerID,
-			Player1:  players[0],
-			Player2:  players[1],
-		})
+			Player1:  player1,
+			Player2:  player2,
+		}
+		LockTheGame(d, lg)
 
-		// Wait for the release notification
-		select {
-		case playerID := <-w.ReleaseChan:
-			// Release the player if it matches any of the announced players
-			if players[0].PlayerID == playerID || players[1].PlayerID == playerID {
-				// Release the player and proceed to the next iteration
-				continue
-			}
+		newCmd := &LetsStartTheGameCmd{
+			GameID:    gameID,
+			Player1:   player1.PlayerID,
+			Player2:   player2.PlayerID,
+			Timestamp: time.Now(),
+		}
+		// Check for acknowledgments and delete or start the game as needed
+		if checkForPlayerAck(&LetsStartTheGameCmd{GameID: gameID}, lg) {
+
+			d.CommandDispatcher(newCmd)
+		} else {
+			Delete(gameID)
 		}
 	}
 }
 
-func (d *Dispatcher) StartWorkerPool(numWorkers int) {
-	// Create a new channel to announce games
-	announceGameChan := make(chan *GameAnnouncementEvent)
+func checkForPlayerAck(cmd *LetsStartTheGameCmd, lg *LockedGame) bool {
+	acked := false
 
-	// Create and start a pool of workers
-	workers := make([]*Worker, numWorkers)
-	for i := 0; i < numWorkers; i++ {
-		workers[i] = NewWorker()
-		go workers[i].Run(d)
+	// Wait for player1's acknowledgement
+	time.Sleep(5 * time.Second)
+	if isGameAcknowledged(cmd.GameID, lg.Player1.PlayerID) {
+		// Player1 acknowledged, proceed to wait for player2's acknowledgement
+		time.Sleep(5 * time.Second)
+		if isGameAcknowledged(cmd.GameID, lg.Player2.PlayerID) {
+			acked = true
+		}
 	}
 
-	// players join buffered game channel via the front end
-	var gameChan = make(chan *PlayerIdentity, 2)
-	var playerCount int     // Counter to keep track of the number of players joined
-	var lastWorkerIndex int // Keep track of the index of the last assigned worker
+	if acked == false {
+		Delete(cmd.GameID)
+	}
 
-	lastWorkerIndex = 0
-	playerCount = 0
+	return acked
+}
 
-	go func() {
-		for {
-			select {
-			case player := <-gameChan:
-				// Use round-robin to select the next worker
-				lastWorkerIndex = (lastWorkerIndex + 1) % numWorkers
-				workers[lastWorkerIndex].PlayerChan <- player
+func (d *Dispatcher) StartWorkerPool(numWorkers int) {
+		// Create a Lobby
+		lobby := NewLobby(numWorkers)
 
-				playerCount++
-				if playerCount == 2 {
-					// Announce the game with the locked players in a new goroutine
-					go lockGame(d, LockedGame)
-
-					// Close the channel to indicate that no more players should be added
-					close(gameChan)
-
-					// the worker knows the gameID because it was set during "Run" function
-					gameID := workers[lastWorkerIndex].GameID
-				}
-
-			case <-time.After(15 * time.Second):
-				// Timeout if the second player doesn't send identity within 15 seconds.
-				d.errorLogger.InfoLog(
-					context.TODO(),
-					"Timeout: Second player didn't send identity within 15 seconds.",
-					zap.String("PlayerID", player.PlayerID),
-				)
-				close(gameChan) // Close the channel to stop waiting for more players
-				return
-			}
+		// Start the Lobby
+		go lobby.Run()
+	
+		// Create and register workers
+		allWorkers := make([]*Worker, numWorkers)
+		for i := 0; i < numWorkers; i++ {
+			workerID := fmt.Sprintf("worker%02d", i+1)
+			allWorkers[i] = NewWorker(workerID)
+			go allWorkers[i].WorkerRun(d) // start the worker's processing loop
+			lobby.AddWorker(allWorkers[i])
 		}
-	}()
-
-	go func() {
+	
+		// Add players as they join
 		for {
-			select {
-			case announceEvent := <-announceGameChan:
-				// Announce the game with the locked players
-				d.EventDispatcher(announceEvent)
-
-				// Notify all workers to release players that match the announced game's players
-				for _, w := range workers {
-					select {
-					case w.ReleaseChan <- announceEvent.FirstPlayerID:
-					case w.ReleaseChan <- announceEvent.SecondPlayerID:
-					default:
-						// If the worker's broadcast channel is busy, skip and proceed to the next worker
-					}
-				}
-			}
+			player := waitForNewPlayer() // hypothetical function to wait for a new player
+			lobby.AddPlayer(player)
 		}
-	}()
-
-	go func() {
-		for {
-			select {
-			case announceEvent := <-announceGameChan:
-				// Announce the game with the locked players
-				d.EventDispatcher(announceEvent)
-
-				// Notify all workers to release players that match the announced game's players
-				for _, w := range workers {
-					for {
-						select {
-						case w.ReleaseChan <- announceEvent.FirstPlayerID:
-							break
-						case w.ReleaseChan <- announceEvent.SecondPlayerID:
-							break
-						case <-time.After(time.Second * 15):
-							// If the worker's broadcast channel is busy for more than 5 seconds, log and skip
-							d.errorLogger.InfoLog("Warning: Worker's broadcast channel was busy for 5 seconds for PlayerID: %s in GameID: %s. Skipping...", player.PlayerID, gameID)
-							break
-						default:
-							time.Sleep(time.Millisecond * 100) // If the channel is busy, wait and try again
-							continue
-						}
-						break
-					}
-				}
-			}
-		}
-	}()
-	return
 }

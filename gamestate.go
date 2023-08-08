@@ -169,3 +169,28 @@ func (gsp *GameStatePersister) FetchGS(gameID string) (*AcceptedMoves, error) {
 
 	return data, nil
 }
+func (d *Dispatcher) getCacheSize(key string) (int, error) {
+	ctx := context.Background()
+	//numElements, err := d.client.HLen(context.Background(), key).Result()
+	allKeys, err := (d.client.HKeys(context.Background(), key)).Result()
+	if err != nil {
+		d.errorLogger.ErrorLog(ctx,"error querying caches key list", err)
+		return -1, nil
+	}
+
+	numElements := len(allKeys)
+	maxCounter := 0
+	for p := range allKeys {
+		pp, _ := strconv.Atoi(allKeys[p])
+		if pp > maxCounter {
+			maxCounter = pp
+		}
+	}
+
+	if int(numElements) != maxCounter {
+		d.errorLogger.ErrorLog(ctx,"error querying cache", fmt.Errorf("numElements != maxMoveCounter"))
+		return -1, nil
+	}
+
+	return maxCounter, nil
+}

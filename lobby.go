@@ -1,7 +1,7 @@
 package main
 
 import (
-	"atomic"
+	"sync/atomic"
 )
 
 // Define a Lobby type that will manage the waiting players
@@ -11,10 +11,14 @@ type Lobby struct {
 	playerCount int32 // Use an int32 to allow for atomic operations
 }
 
+var (
+	playersPerWorker = 30
+)
+
 // NewLobby creates a new Lobby instance
 func NewLobby(numWorkers int) *Lobby {
 	return &Lobby{
-		PlayerQueue: make(chan PlayerIdentity, 100*numWorkers),
+		PlayerQueue: make(chan PlayerIdentity, playersPerWorker*numWorkers),
 		workerQueue: make(chan *Worker, numWorkers),
 		playerCount: 0,
 	}

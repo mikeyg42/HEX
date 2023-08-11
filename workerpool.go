@@ -32,9 +32,9 @@ func GenerateUniqueGameID(db *PostgresGameState, w *Worker) (string, error) {
 }
 
 func Delete(gameID string) {
-	lockMutex.Lock()
-	delete(allLockedGames, gameID) // Remove the game from the map
-	lockMutex.Unlock()
+    lockMutex.Lock()
+    delete(allLockedGames, gameID) // Remove the game from the map
+    lockMutex.Unlock()
 }
 
 // Define the acknowledgment map and mutex
@@ -43,74 +43,65 @@ var (
 	ackMutex        = sync.Mutex{}
 )
 
-// Function to check if both players have acknowledged the game
 func isGameAcknowledged(gameID, playerID string) bool {
 	ackMutex.Lock()
 	defer ackMutex.Unlock()
 
-	// Check if the game is already in the acknowledgment map
-	if acks, ok := acknowledgments[gameID]; ok {
-		// Check if the player is not already in the acknowledgments
-		for _, ackPlayerID := range acks {
-			if ackPlayerID == playerID {
-				// Player already acknowledged the game
-				return true
-			}
-		}
-
-		// Add the player to the acknowledgments for this game
-		acknowledgments[gameID] = append(acks, playerID)
-
-		// Check if both players have acknowledged the game
-		if len(acknowledgments[gameID]) == 2 {
-			// If both players acknowledged, delete the game entry from the map
-			delete(acknowledgments, gameID)
-			return true
-		}
-	} else {
+	acks, ok := acknowledgments[gameID]
+	if !ok {
 		// If the game is not in the acknowledgments, create a new entry for it
 		acknowledgments[gameID] = []string{playerID}
+		return false
 	}
 
-	return false
+	// Check if the player has already acknowledged the game
+	if acks[0] == playerID || acks[1] == playerID {
+		return true
+	}
+
+	// Add the player to the acknowledgments for this game
+	acknowledgments[gameID] = []string{acks[0], playerID}
+
+	// Both players acknowledged, delete the game entry from the map
+	delete(acknowledgments, gameID)
+	return true
 }
 
+
 func LockTheGame(d *Dispatcher, lg LockedGame) {
-	gameID := lg.GameID
+    ackCount := 0
+    var wg sync.WaitGroup
+    wg.Add(2)
 
-	lockMutex.Lock()
-	_, ok := allLockedGames[gameID]
-	// add to map if not already there
-	if !ok {
-		allLockedGames[gameID] = lg
-	}
-	lockMutex.Unlock()
+    go func() {
+        defer wg.Done()
+        if isGameAcknowledged(lg.GameID, lg.Player1.PlayerID) {
+            ackCount++
+        }
+    }()
 
-	P1 := lg.Player1.PlayerID
-	P2 := lg.Player2.PlayerID
+    go func() {
+        defer wg.Done()
+        if isGameAcknowledged(lg.GameID, lg.Player2.PlayerID) {
+            ackCount++
+        }
+    }()
 
-	// Wait for player1+2's acknowledgement
-	time.Sleep(5 * time.Second)
-	if isGameAcknowledged(gameID, P1) {
-		time.Sleep(5 * time.Second)
-		if isGameAcknowledged(gameID, P2) {
-			// both acknowledged, start the game
+    wg.Wait()
 
-			newCmd := &LetsStartTheGameCmd{
-				GameID:    gameID,
-				Player1:   P1,
-				Player2:   P2,
-				Timestamp: time.Now(),
-			}
-
-			d.CommandDispatcher(newCmd)
-
-			return
-		}
-	}
-	// Players didn't acknowledge, abort the game
-	Delete(gameID)
-	return
+    if ackCount == 2 {
+        // Both acknowledged, start the game
+        newCmd := &LetsStartTheGameCmd{
+            GameID:    lg.GameID,
+            Player1:   lg.Player1.PlayerID,
+            Player2:   lg.Player2.PlayerID,
+            Timestamp: time.Now(),
+        }
+        d.CommandDispatcher(newCmd)
+    } else {
+        // Players didn't acknowledge, abort the game
+        Delete(lg.GameID)
+    }
 }
 
 func NewWorker(workerID string) *Worker {
@@ -123,62 +114,64 @@ func NewWorker(workerID string) *Worker {
 }
 
 func (w *Worker) WorkerRun(d *Dispatcher) {
-	for {
-		player1 := <-w.PlayerChan
-		player2 := <-w.PlayerChan
+    for {
+        player1 := <-w.PlayerChan
+        player2 := <-w.PlayerChan
 
-		// Generate a unique game ID
-		gameID, err := GenerateUniqueGameID(d.persister.postgres, w)
-		if err != nil {
-			// Handle the error here
-			continue
-		}
-		w.GameID = gameID
+        // Generate a unique game ID
+        gameID, err := GenerateUniqueGameID(d.persister.postgres, w)
+        if err != nil {
+            // Handle the error here
+            continue
+        }
+        w.GameID = gameID
 
-		// Lock the game
-		lg := LockedGame{
-			GameID:   gameID,
-			WorkerID: w.WorkerID,
-			Player1:  player1,
-			Player2:  player2,
-		}
-		LockTheGame(d, lg)
-
-		newCmd := &LetsStartTheGameCmd{
-			GameID:    gameID,
-			Player1:   player1.PlayerID,
-			Player2:   player2.PlayerID,
-			Timestamp: time.Now(),
-		}
-		// Check for acknowledgments and delete or start the game as needed
-		if checkForPlayerAck(&LetsStartTheGameCmd{GameID: gameID}, lg) {
-
-			d.CommandDispatcher(newCmd)
-		} else {
-			Delete(gameID)
-		}
-	}
+        // Lock the game
+        lg := LockedGame{
+            GameID:   gameID,
+            WorkerID: w.WorkerID,
+            Player1:  player1, 
+            Player2:  player2,
+        }
+        LockTheGame(d, lg) // Start or delete the game based on acknowledgment
+    }
 }
 
 func checkForPlayerAck(cmd *LetsStartTheGameCmd, lg *LockedGame) bool {
-	acked := false
+    var wg sync.WaitGroup
+    ackCh := make(chan bool, 2)
+    ackCount := 0
 
-	// Wait for player1's acknowledgement
-	time.Sleep(5 * time.Second)
-	if isGameAcknowledged(cmd.GameID, lg.Player1.PlayerID) {
-		// Player1 acknowledged, proceed to wait for player2's acknowledgement
-		time.Sleep(5 * time.Second)
-		if isGameAcknowledged(cmd.GameID, lg.Player2.PlayerID) {
-			acked = true
-		}
-	}
+    checkAndAck := func(playerID string) {
+        defer wg.Done()
+        if isGameAcknowledged(cmd.GameID, playerID) {
+            ackCh <- true
+        }
+    }
 
-	if acked == false {
-		Delete(cmd.GameID)
-	}
+    wg.Add(2)
+    go checkAndAck(lg.Player1.PlayerID)
+    go checkAndAck(lg.Player2.PlayerID)
 
-	return acked
+    wg.Wait()
+    close(ackCh)
+
+    // Count the number of true acknowledgments received
+    for ack := range ackCh {
+        if ack {
+            ackCount++
+        }
+    }
+
+    // Check if both players acknowledged
+    if ackCount == 2 {
+        return true
+    }
+
+    Delete(cmd.GameID)
+    return false
 }
+
 
 func (d *Dispatcher) StartWorkerPool(numWorkers int) {
 		// Create a Lobby
@@ -195,10 +188,35 @@ func (d *Dispatcher) StartWorkerPool(numWorkers int) {
 			go allWorkers[i].WorkerRun(d) // start the worker's processing loop
 			lobby.AddWorker(allWorkers[i])
 		}
+
+		newPlayerChan := make(chan PlayerIdentity)
+
+		// hypothetical function to start waiting for new players over network, etc.
+		go waitForNewPlayer(newPlayerChan)
 	
 		// Add players as they join
 		for {
-			player := waitForNewPlayer() // hypothetical function to wait for a new player
+			player := <-newPlayerChan // wait for a new player from the channel
 			lobby.AddPlayer(player)
 		}
+	}
+
+func waitForNewPlayer(newPlayerChan chan PlayerIdentity) {
+	for {
+		// Here would be logic to wait for a new player over network, etc.
+		player := getNewPlayer()
+		newPlayerChan <- player // send new player to the channel
+	}
+}
+
+func getNewPlayer() PlayerIdentity {
+	// get the player from the lobby somehow???
+
+	// waiting for a connection from a client,
+	return PlayerIdentity{
+		PlayerID:       "00000001", // an internally assigned integer to avoid unnecessary propogation of their username 
+		Username: 		"kushlord123", // probably will not ultimately be here included....
+		CurrentPlayerRank:   10, // example
+
+	}
 }

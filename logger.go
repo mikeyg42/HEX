@@ -43,7 +43,10 @@ func initLogger(logFilePath string, level gormlogger.LogLevel) Logger {
 		writeSyncer,
 		zap.NewAtomicLevelAt(zapcore.Level(level)),
 	)
-
+	if core == nil {
+		panic("core is nil")
+	}
+	
 	logger := zap.New(core, zap.AddCaller(), zap.AddCallerSkip(1))
 
 	return Logger{

@@ -15,7 +15,7 @@ import (
 )
 
 // ..... INITIALIZE BOTH DATASTORES
-
+/* 
 // functions that are called once prior to any game starting!
 func InitializePostgres(ctx context.Context) (*PostgresGameState, error) {
 	logger, ok := ctx.Value(errorLoggerKey{}).(Logger)
@@ -57,15 +57,15 @@ func InitializePostgres(ctx context.Context) (*PostgresGameState, error) {
 
 	// declare DB as a PostgresGameState
 	return &PostgresGameState{DB: db}, nil
-}
+} */
 
-func createGameStatePersist(ctx context.Context, redisClient *redis.Client) (*GameStatePersister, error) {
+/* func createGameStatePersist(ctx context.Context, redisClient *redis.Client) (*GameStatePersister, error) {
 	pgs, err := InitializePostgres(ctx)
 	return &GameStatePersister{
 		postgres: pgs,
 		redis:    &RedisGameState{redisClient},}, err
-}
-
+} */
+/* 
 // ..... SAVE A MOVE TO BOTH DATASTORES
 func (gsp *GameStatePersister) PersistMove(ctx context.Context, newMove *GameStateUpdate) error {
 
@@ -155,48 +155,7 @@ func (gsp *GameStatePersister) FetchFromRedis(ctx context.Context, gameID string
 	err = checkDatastoreSize(allMoves)
 
 	return allMoves, err
-}
+} */
 
-func largestKey(m []string) int {
-	maxKey := 0
-	for k := range m {
-		if k > maxKey {
-			maxKey = k
-		}
-	}
-	return maxKey
-}
-
-func checkDatastoreSize(data []string) error {
-	// here we calculate the  size using length and then we also identify the highest move #. if nothing is skipped that, for ex. in a 3 item list starting at 1, the highest value will be also 3
-
-	numElements := len(data)
-	largestKey := largestKey(data)
-
-	diff := largestKey - int(numElements)
-
-	if diff != 0 {
-		err := fmt.Errorf("error when querying datastore", zap.String("missing the following # of elements in data map: ", string(diff)))
-		return err
-	}
-
-	return nil
-}
-
-func convertToInt(xCoord string) (int, error) {
-	if len(xCoord) != 1 {
-		return -1, errors.New("invalid input length for xCoord")
-	}
-	return int(xCoord[0]) - int('A') + 1, nil
-}
-
-func convertToTypeVertex(xCoord string, yCoord int) (Vertex, error) {
-	x, err := convertToInt(xCoord)
-	if err != nil {
-		return Vertex{}, err
-	}
-	
-	return Vertex{X: x, Y: yCoord}, nil
-}
 
 

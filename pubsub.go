@@ -26,8 +26,17 @@ var eventTypeMap = map[string]interface{}{
 	"InvalidMoveEvent":      &InvalidMoveEvent{},
 	"OfficialMoveEvent":     &OfficialMoveEvent{},
 	"GameStateUpdate":       &GameStateUpdate{},
-	"GameEndsEvent":         &GameEndsEvent{},
 	"GameStartEvent":        &GameStartEvent{},
+	"NextTurnStartsEvent":   &NextTurnStartsEvent{},
+}
+
+type NextTurnStartsEvent struct {
+	Event
+	GameID             string
+	PriorPlayerID      string
+	NextPlayerID       string
+	UpcomingMoveNumber int
+	TimeStamp          time.Time
 }
 
 type GameAnnouncementEvent struct {
@@ -66,32 +75,19 @@ type OfficialMoveEvent struct {
 	PlayerID  string    `json:"playerId"`
 	MoveData  string    `json:"moveData"`
 	Timestamp time.Time `json:"timestamp"`
-	AcceptedMoves *AcceptedMoves	`json:"acceptedMoves"`
-}
-
-type GameEndsEvent struct {
-	Event
-	GameID       string `json:"gameId"`
-	WinnerID     string `json:"winnerId"`
-	LoserID      string `json:"loserId"`
-	WinCondition string `json:"moveData"`
 }
 
 type GameStateUpdate struct {
-	gorm.Model		   `redis:"-"`
-	Event			   `redis:"-"`
-	GameID      string 
-	MoveCounter int    
-	PlayerID    string 
+	gorm.Model  `redis:"-"`
+	Event       `redis:"-"`
+	GameID      string
+	MoveCounter int
+	PlayerID    string
 	xCoordinate string
 	yCoordinate int
 
-	ConcatenatedMove string	`redis:"-"`
+	ConcatenatedMove string `redis:"-"`
 }
-
-/* type AcceptedMoves struct {
-	list map[int]string
-} */
 
 // ...................... game Lock ......................//
 const moveTimeout = 30 * time.Second
@@ -115,6 +111,14 @@ var cmdTypeMap = map[string]interface{}{
 	"PlayerForfeitingCmd": &PlayerForfeitingCmd{},
 	"UpdatingCmd":         &UpdatingCmd{},
 	"StartNextTurnCmd":    &StartNextTurnCmd{},
+	"EndingGameCmd":         &EndingGameCmd{},
+}
+type EndingGameCmd struct {
+	Command
+	GameID       string `json:"gameId"`
+	WinnerID     string `json:"winnerId"`
+	LoserID      string `json:"loserId"`
+	WinCondition string `json:"moveData"`
 }
 
 type DeclaringMoveCmd struct {
@@ -168,14 +172,13 @@ type UpdatingCmd struct {
 	SourcePlayerID string    `json:"playerId"`
 	DeclaredMove   string    `json:"moveData"`
 	Timestamp      time.Time `json:"timestamp"`
-
 }
 
 //.............. PERSISTENCE ....................//
 
 type Event interface {
 	// ModifyPersistedDataTable will be used by events to persist data to the database.
-	ModifyPersistedDataTable(ctx context.Context) error 
+	ModifyPersistedDataTable(ctx context.Context) error
 	MarshalEvt() ([]byte, error)
 }
 
@@ -186,7 +189,8 @@ type Command interface {
 const shortDur = 1 * time.Second
 
 type PostgresGameState struct {
-	DB *gorm.DB
+	DB     *gorm.DB
+	logger Logger
 }
 
 var (
@@ -196,6 +200,7 @@ var (
 
 type RedisGameState struct {
 	client *redis.Client
+	logger Logger
 }
 
 type GameStatePersister struct {
@@ -209,7 +214,6 @@ type GameStatePersister struct {
 type Dispatcher struct {
 	commandChan     chan interface{}
 	eventChan       chan interface{}
-	client          *redis.Client
 	errorLogger     Logger
 	eventCmdLogger  Logger
 	commandHandlers map[string]func(interface{})
@@ -237,6 +241,8 @@ type eventCmdLoggerKey struct{}
 
 type errorLoggerKey struct{}
 
+type persistLoggerKey struct{}
+
 //................................................//
 //................... MAIN .......................//
 //................................................//
@@ -244,38 +250,52 @@ type errorLoggerKey struct{}
 func main() {
 	eventCmdLogger := initLogger("/Users/mikeglendinning/projects/HEX/eventCommandLog.log", gormlogger.Info)
 	errorLogger := initLogger("/Users/mikeglendinning/projects/HEX/errorLog.log", gormlogger.Info)
+	persistLogger := initLogger("/Users/mikeglendinning/projects/HEX/persistLog.log", gormlogger.Info)
 
-	eventCmdCtx := context.WithValue(context.Background(), eventCmdLoggerKey{}, eventCmdLogger)
-	ctx := context.WithValue(eventCmdCtx, errorLoggerKey{}, errorLogger)
+	parentCtx, parentCancelFunc := context.WithCancel(context.Background())
+	eventCmdCtx := context.WithValue(parentCtx, eventCmdLoggerKey{}, eventCmdLogger)
+	errorLogCtx := context.WithValue(parentCtx, errorLoggerKey{}, errorLogger)
+	persistCtx := context.WithValue(parentCtx, persistLoggerKey{}, persistLogger)
 
 	eventCmdLogger.ZapLogger.Sync()
 	errorLogger.ZapLogger.Sync()
+	persistLogger.ZapLogger.Sync()
 
 	eventCmdLogger.InfoLog(eventCmdCtx, "EventCmdLogger Initiated", zap.Bool("EventCmdLogger Activation", true))
-	errorLogger.InfoLog(ctx, "ErrorLogger Initiated", zap.Bool("ErrorLogger Activation", true))
+	errorLogger.InfoLog(errorLogCtx, "ErrorLogger Initiated", zap.Bool("ErrorLogger Activation", true))
 
 	client, err := getRedisClient(RedisAddr)
 	if err != nil {
-		errorLogger.ErrorLog(ctx, "Error getting Redis Client", zap.Bool("get redisClient", false))
+		errorLogger.ErrorLog(parentCtx, "Error getting Redis Client", zap.Bool("get redisClient", false))
 		return
 	}
 
+	gsp, err := InitializePersistence(persistCtx)
+	if err != nil {
+		errorLogger.ErrorLog(parentCtx, "Error initializing persistence", zap.Bool("initialize persistence", false))
+	}
+
 	// Initialize command and event dispatchers
-	d := NewDispatcher(ctx, client, errorLogger, eventCmdLogger)
+	d := NewDispatcher(parentCtx, gsp, errorLogger, eventCmdLogger)
 
 	// Starts the command and event dispatchers's goroutines
-	d.Start(ctx)
+	d.Start(parentCtx)
 
 	//....... some stuff?
 
+	// flush logger queues I think?
 	eventCmdLogger.ZapLogger.Sync()
 	errorLogger.ZapLogger.Sync()
+	persistLogger.ZapLogger.Sync()
 
 	// Close the Redis client
 	err = client.Close()
 	if err != nil {
-		errorLogger.ErrorLog(ctx, "Error closing Redis client:", zap.Error(err))
+		errorLogger.ErrorLog(parentCtx, "Error closing Redis client:", zap.Bool("close redis client", false), zap.Error(err))
 	}
+
+	// cancel the parent context, canceling all children too
+	parentCancelFunc()
 }
 
 //................................................//
@@ -310,7 +330,9 @@ func (d *Dispatcher) handleCommandWrapper(cmd interface{}) {
 }
 
 // Event Handler
-func (d *Dispatcher) handleEvent(ctx context.Context, done <-chan struct{}, event Event, eventPubSub *redis.PubSub) error {
+func (d *Dispatcher) handleEvent(done <-chan struct{}, event Event, eventPubSub *redis.PubSub) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	switch event := event.(type) {
 	case *InvalidMoveEvent:
@@ -323,35 +345,24 @@ func (d *Dispatcher) handleEvent(ctx context.Context, done <-chan struct{}, even
 		d.timer.StopTimer()
 
 		// This will parse the new move and then publish another message to the event bus that will be picked up by persisting logic and the win condition logic
-		newEvt := d.WrappedHandlerforEachlMoveEvent(ctx, event)
+		newEvt := d.Handler_OfficialMoveEvt(ctx, event)
 		d.EventDispatcher(newEvt)
-
-	case *GameEndsEvent:
-
-		d.eventCmdLogger.Info(ctx, event.GameID+" is over", zap.String("Winner", event.WinnerID), zap.String("Loser", event.LoserID), zap.String("WinCondition", event.WinCondition))
-
-		// Persist the game end to a database
-		err := event.ModifyPersistedDataTable()
-		if err != nil {
-			d.errorLogger.Error(ctx, "Error persisting games end move: %v", err)
-		}
-		eventPubSub.Close()
 
 	case *GameStateUpdate:
 		// Persist the data and check win conditions
-		err := d.persister.PersistMove(event)
-		if err != nil {
-			d.errorLogger.ErrorLog(ctx, "Error updating game state persistence: %v", zap.Error(err))
+		newEvt, yesEvt := d.persister.HandleGameStateUpdate(event)
+		
+		// If yesEvt is true, then the handler will output an event, namely, nextTurnStartsEvent	
+		if yesEvt {
+			d.EventDispatcher(newEvt)
+		} else {
+			d.CommandDispatcher(newEvt)
 		}
+		d.timer.StopTimer() //always do this before starting timer again to ensure that the
 
-		newCmd := &CheckForWinConditionCmd{
-			GameID:    event.GameID,
-			MoveCount: event.MoveCounter,
-			PlayerID:  event.PlayerID,
-			Timestamp: time.Now(),
-		}
-
-		d.CommandDispatcher(newCmd)
+	case *NextTurnStartsEvent:
+		d.eventCmdLogger.Info(ctx, "NextTurnStartsEvent received for game: "+event.GameID)
+		d.timer.StartTimer()
 
 	default:
 		d.errorLogger.Error(ctx, "Unknown event type: %v", fmt.Errorf("Weird event type: %T", event))
@@ -362,57 +373,72 @@ func (d *Dispatcher) handleEvent(ctx context.Context, done <-chan struct{}, even
 
 func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPubSub *redis.PubSub) {
 	ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+	defer cancel()
 
 	switch cmd := cmd.(type) {
+
+	case *GameEndingCmd:
+		d.timer.StopTimer()
+		d.eventCmdLogger.Info(ctx, cmd.GameID+" is over", zap.String("Winner", cmd.WinnerID), zap.String("Loser", cmd.LoserID), zap.String("WinCondition", cmd.WinCondition))
+
+		// clear redis 
+		
+
+		gracefullyShutDownGame()
+		commandPubSub.Close()
+
 	case *DeclaringMoveCmd:
-
-		//key := "acceptedMoveList" // key is for accessing the cache
-
-		acceptedMoves, err := d.persister.FetchGS(cmd.GameID)
+		xcoords, ycoords, lastPostgresCounter, err := d.persister.postgres.FetchGS_sql(ctx, cmd.GameID, "all")
 		if err != nil {
-			d.errorLogger.ErrorLog(ctx, "Error fetching game state from persistence: %v", zap.Error(err))
+			d.persister.postgres.logger.ErrorLog(ctx, "Error fetching game state from persistence", zap.Error(err))
+			return
 		}
 
-		// extract the moveData from the command
 		moveData := cmd.DeclaredMove
 		moveParts := strings.Split(moveData, ".")
 		new_key, _ := strconv.Atoi(moveParts[0])
-		new_val := moveParts[2]
 
-		validMove := true
-		// first we check if the list of all moves contains already a move with the same moveCounter (ie the 25th tile is already set)
-		if _, ok := acceptedMoves.list[new_key]; ok {
-			d.errorLogger.InfoLog(ctx, "This moveCounter value is already present in the AcceptedMoves list", zap.String("DuplicateMoveNumber", moveData))
-			validMove = false
-		} else {
-			// second, we check if the unique moveCounter cooresponds to a unique coordinate
-			reversedMap := reverseMap(acceptedMoves.list)
-			if _, found := reversedMap[new_val]; found {
-				d.errorLogger.InfoLog(ctx, "This xy coord pair is already present in the AcceptedMoves list", zap.String("DuplicatePosition", moveData))
-				validMove = false
-			}
+		if new_key != lastPostgresCounter+1 {
+			d.errorLogger.ErrorLog(ctx, "Unexpected moveCounter value from declaredMove", zap.Int("expected", lastPostgresCounter+1), zap.Int("received", new_key))
+			return
 		}
 
+		new_val := moveParts[2]
+		validMove := true
+
+		coordMap, reversedMap, err := createCoordMaps(xcoords, ycoords)
+		if err != nil {
+			d.errorLogger.ErrorLog(ctx, "Error creating coordinate maps", zap.Error(err))
+			return
+		}
+
+		// Verify move
+		if _, ok := coordMap[new_key]; ok {
+			d.errorLogger.InfoLog(ctx, "Duplicate moveCounter in AcceptedMoves list", zap.String("DuplicateMoveNumber", moveData))
+			validMove = false
+		} else if _, found := reversedMap[new_val]; found {
+			d.errorLogger.InfoLog(ctx, "Duplicate xy coord pair in AcceptedMoves list", zap.String("DuplicatePosition", moveData))
+			validMove = false
+		}
+
+		// Dispatch Event based on validation
+		var newEvent interface{}
 		if !validMove {
-			newEvent := &InvalidMoveEvent{
+			newEvent = &InvalidMoveEvent{
 				GameID:      cmd.GameID,
 				PlayerID:    cmd.SourcePlayerID,
 				InvalidMove: cmd.DeclaredMove,
 			}
-			d.EventDispatcher(newEvent)
-
 		} else {
-			newEvent := &OfficialMoveEvent{
+			newEvent = &OfficialMoveEvent{
 				GameID:    cmd.GameID,
 				PlayerID:  cmd.SourcePlayerID,
 				MoveData:  cmd.DeclaredMove,
 				Timestamp: time.Now(),
-				AcceptedMoves: &AcceptedMoves.list,
 			}
-
-			d.EventDispatcher(newEvent)
 		}
+		d.EventDispatcher(newEvent)
+
 	case *PlayerForfeitingCmd:
 
 		d.eventCmdLogger.Info(ctx, "Player forfeited the game", zap.String("PlayerID", cmd.SourcePlayerID), zap.String("GameID", cmd.GameID), zap.String("ForfeitReason", cmd.Reason))
@@ -421,17 +447,17 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 
 		// Determine who the winner is via the allLockedGames struct and the PlayerForfeitingCmd
 		lg := allLockedGames[cmd.GameID]
-		var newEvt *GameEndsEvent
+		var newCmd *EndingGameCmd
 
 		if cmd.SourcePlayerID == lg.Player1.PlayerID {
-			newEvt = &GameEndsEvent{
+			newCmd = &EndingGameCmd{
 				GameID:       cmd.GameID,
 				LoserID:      cmd.SourcePlayerID,
 				WinnerID:     lg.Player2.PlayerID,
 				WinCondition: "Forfeit: " + cmd.Reason,
 			}
 		} else if cmd.SourcePlayerID == lg.Player2.PlayerID {
-			newEvt = &GameEndsEvent{
+			newCmd = &EndingGameCmd{
 				GameID:       cmd.GameID,
 				LoserID:      cmd.SourcePlayerID,
 				WinnerID:     lg.Player1.PlayerID,
@@ -440,8 +466,8 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 		} else {
 			d.errorLogger.ErrorLog(ctx, "Error parsing the winner from AllLockedGames global", zap.String("LoserID", cmd.SourcePlayerID), zap.String("GameID", cmd.GameID), zap.String("ForfeitReason", cmd.Reason))
 		}
-		d.EventDispatcher(newEvt)
-
+		d.CommandDispatcher(newCmd)
+ 
 	case *LetsStartTheGameCmd: // this command is generated by the LockTheGame function found in the workerpool code
 
 		// Create a new channel for this game instance
@@ -471,23 +497,7 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 		d.timer = MakeNewTimer()
 		d.timer.startChan <- struct{}{}
 
-	case *CheckForWinConditionCmd:
-
-		d.persister.FetchGS(cmd.GameID)
-
-
-
-		newCmd := &CheckForWinConditionCmd{
-			GameID:    event.GameID,
-			MoveCount: event.MoveCounter,
-			PlayerID:  event.PlayerID,
-			Timestamp: time.Now()
-
-
-
-	
-
-}
+	}
 }
 
 func (d *Dispatcher) parseOfficialMoveEvt(ctx context.Context, e *OfficialMoveEvent) (*GameStateUpdate, error) {
@@ -523,17 +533,17 @@ func (d *Dispatcher) parseOfficialMoveEvt(ctx context.Context, e *OfficialMoveEv
 	}
 
 	update := &GameStateUpdate{
-		GameID:      gameID,
-		PlayerID:    playerID,
-		MoveCounter: moveCounter,
-		xCoordinate: xCoordinate,
-		yCoordinate: yCoordinate,
+		GameID:           gameID,
+		PlayerID:         playerID,
+		MoveCounter:      moveCounter,
+		xCoordinate:      xCoordinate,
+		yCoordinate:      yCoordinate,
 		ConcatenatedMove: coordinates,
 	}
 	return update, nil
 }
 
-func (d *Dispatcher) WrappedHandlerforEachlMoveEvent(ctx context.Context, evt *OfficialMoveEvent) *GameStateUpdate {
+func (d *Dispatcher) Handler_OfficialMoveEvt(ctx context.Context, evt *OfficialMoveEvent) *GameStateUpdate {
 
 	newEvt, err := d.parseOfficialMoveEvt(ctx, evt)
 	if err != nil {
@@ -542,10 +552,17 @@ func (d *Dispatcher) WrappedHandlerforEachlMoveEvent(ctx context.Context, evt *O
 	return newEvt
 }
 
-func reverseMap(m map[int]string) map[string]int {
-	n := make(map[string]int, len(m))
-	for k, v := range m {
-		n[v] = k
+func createCoordMaps(xCoords []string, yCoords []int) (map[int]string, map[string]int, error) {
+	if len(xCoords) != len(yCoords) {
+		return nil, nil, fmt.Errorf("Mismatched input lengths")
 	}
-	return n
+
+	resultMap := make(map[int]string, len(xCoords))
+	reverseMap := make(map[string]int, len(xCoords))
+	for i, x := range xCoords {
+		coordPair := x + strconv.Itoa(yCoords[i])
+		resultMap[i+1] = coordPair
+		reverseMap[coordPair] = i + 1
+	}
+	return resultMap, reverseMap, nil
 }

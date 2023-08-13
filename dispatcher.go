@@ -6,21 +6,16 @@ import (
 	"fmt"
 	"reflect"
 
-	redis "github.com/redis/go-redis/v9"
 	zap "go.uber.org/zap"
 )
 
 // NewDispatcher creates a new Dispatcher instance.
-func NewDispatcher(ctx context.Context, client *redis.Client, errorLogger Logger, eventCmdLogger Logger) *Dispatcher {
-	gsp, err := createGameStatePersist(ctx, client)
-	if err != nil {
-		errorLogger.ErrorLog(context.Background(), "Error creating GameStatePersister", zap.Error(err))
-	}
+func NewDispatcher(ctx context.Context, gsp *GameStatePersister, errorLogger Logger, eventCmdLogger Logger) *Dispatcher {
+	// Create a new Dispatcher instance
 
 	d := &Dispatcher{
 		commandChan:    make(chan interface{}),
 		eventChan:      make(chan interface{}),
-		client:         client,
 		errorLogger:    errorLogger,
 		eventCmdLogger: eventCmdLogger,
 		persister:      gsp,
@@ -79,7 +74,7 @@ func (d *Dispatcher) commandDispatcher(ctx context.Context, errChan chan<- error
 		}
 
 		// Publish command to Redis Pub/Sub channel
-		err = d.client.Publish(ctx, "commands", payload).Err()
+		err = d.persister.redis.client.Publish(ctx, "commands", payload).Err()
 		if err != nil {
 			//			logger.InfoLog(ctx, "Error Publishing command", zap.Error(err))
 			errChan <- err
@@ -93,23 +88,16 @@ func (d *Dispatcher) EventDispatcher(event interface{}) {
 }
 
 func (d *Dispatcher) eventDispatcher(ctx context.Context, errChan chan<- error) {
-	//logger, ok := ctx.Value(errorLoggerKey{}).(Logger)
-	//if !ok {
-	//	errChan <- fmt.Errorf("failed to get logger from context in eventDispatcher")
-	//}
-
 	for event := range d.eventChan {
 
 		payload, err := json.Marshal(event)
 		if err != nil {
-			//logger.ErrorLog(ctx, "Error marshaling event (eventDispatcher)", zap.Error(err))
 			errChan <- err
 		}
 
 		// Publish event to Redis Pub/Sub channel
-		err = d.client.Publish(ctx, "events", payload).Err()
+		err = d.persister.redis.client.Publish(ctx, "events", payload).Err()
 		if err != nil {
-			//logger.ErrorLog(ctx, "Error Publishing event (eventDispatcher)", zap.Error(err))
 			errChan <- err
 		}
 	}
@@ -118,8 +106,10 @@ func (d *Dispatcher) eventDispatcher(ctx context.Context, errChan chan<- error) 
 // Subscribe to commands and events with the done channel
 // subscribeToCommands with error channel
 func (d *Dispatcher) subscribeToCommands(done <-chan struct{}, errChan chan<- error) {
-	ctx := context.Background()
-	commandPubSub := d.client.Subscribe(ctx, "commands")
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	commandPubSub := d.persister.redis.client.Subscribe(ctx, "commands")
+	defer cancelFunc()
+	defer commandPubSub.Close()
 
 	// Command receiver/handler
 	go func() {
@@ -162,9 +152,10 @@ func (d *Dispatcher) subscribeToCommands(done <-chan struct{}, errChan chan<- er
 
 // subscribeToEvents with error channel
 func (d *Dispatcher) subscribeToEvents(done <-chan struct{}, errChan chan<- error) {
-	ctx := context.Background()
-	eventPubSub := d.client.Subscribe(ctx, "events")
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	eventPubSub := d.persister.redis.client.Subscribe(ctx, "events")
 	defer eventPubSub.Close()
+	defer cancelFunc()
 
 	// Event handler
 	go func() {
@@ -201,7 +192,7 @@ func (d *Dispatcher) subscribeToEvents(done <-chan struct{}, errChan chan<- erro
 					continue
 				}
 
-				d.handleEvent(ctx, done, evtTypeAsserted, eventPubSub)
+				d.handleEvent(done, evtTypeAsserted, eventPubSub)
 			}
 		}
 	}()

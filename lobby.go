@@ -8,19 +8,27 @@ import (
 type Lobby struct {
 	PlayerQueue chan PlayerIdentity
 	workerQueue chan *Worker
-	playerCount int32 // Use an int32 to allow for atomic operations
+	playerCount int32 // Use int32 (and not int) to allow for atomic operations
+	workerCount int32 
+	NewPlayerChan chan PlayerIdentity
+	IDnum int
+	consumerGroupKey string
 }
 
 var (
-	playersPerWorker = 30
+	playersPerWorkerAllowedInLobby = 20
 )
 
 // NewLobby creates a new Lobby instance
-func NewLobby(numWorkers int) *Lobby {
+func NewLobby(numWorkers, id int) *Lobby {
+	nAllowedPlayers := playersPerWorkerAllowedInLobby*numWorkers
 	return &Lobby{
-		PlayerQueue: make(chan PlayerIdentity, playersPerWorker*numWorkers),
+		PlayerQueue: make(chan PlayerIdentity, nAllowedPlayers),
 		workerQueue: make(chan *Worker, numWorkers),
 		playerCount: 0,
+		workerCount: int32(numWorkers),
+		NewPlayerChan: make(chan PlayerIdentity),
+		IDnum: id,
 	}
 }
 
@@ -37,6 +45,7 @@ func (l *Lobby) Run() {
 		worker.PlayerChan <- player2
 
 		l.workerQueue <- worker
+		atomic.AddInt32(&l.workerCount, -1) // Two players have left the lobby
 	}
 }
 
@@ -49,4 +58,5 @@ func (l *Lobby) AddPlayer(player PlayerIdentity) {
 // RegisterWorker registers a worker with the Lobby
 func (l *Lobby) AddWorker(worker *Worker) {
 	l.workerQueue <- worker
+	atomic.AddInt32(&l.workerCount, 1)
 }

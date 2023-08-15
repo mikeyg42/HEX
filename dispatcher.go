@@ -32,12 +32,8 @@ func NewDispatcher(ctx context.Context, gsp *GameStatePersister, errorLogger Log
 	return d
 }
 
-//................................................//
-//................DISPATCHERS.....................//
-//................................................//
-
 // Start starts the command and event dispatchers.
-func (d *Dispatcher) Start(ctx context.Context) {
+func (d *Dispatcher) StartDispatcher(ctx context.Context) chan<- error {
 	errChan := make(chan error) // create an error channel
 
 	go d.commandDispatcher(ctx, errChan)
@@ -53,6 +49,7 @@ func (d *Dispatcher) Start(ctx context.Context) {
 			}
 		}
 	}()
+	return errChan
 }
 
 // CommandDispatcher is FIRST STOP for a message in this channel - it dispatches the command to the appropriate channel.
@@ -61,22 +58,16 @@ func (d *Dispatcher) CommandDispatcher(cmd interface{}) {
 }
 
 func (d *Dispatcher) commandDispatcher(ctx context.Context, errChan chan<- error) {
-	//logger, ok := ctx.Value(errorLoggerKey{}).(Logger)
-	//if !ok {
-	//	errChan <- fmt.Errorf("failed to get logger from context in commandDispatcher")
-	//}
 
 	for cmd := range d.commandChan {
 		payload, err := json.Marshal(cmd)
 		if err != nil {
-			//			logger.InfoLog(ctx, "Error marshaling command", zap.Error(err))
 			errChan <- err
 		}
 
 		// Publish command to Redis Pub/Sub channel
 		err = d.persister.redis.client.Publish(ctx, "commands", payload).Err()
 		if err != nil {
-			//			logger.InfoLog(ctx, "Error Publishing command", zap.Error(err))
 			errChan <- err
 		}
 	}

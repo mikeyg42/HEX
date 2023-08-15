@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	zap "go.uber.org/zap"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -99,7 +100,7 @@ func InitializePostgres(ctx context.Context, persistLogger Logger) (*PostgresGam
 
 	// declare DB as a PostgresGameState
 	return &PostgresGameState{
-		db:     db,
+		DB:     db,
 		logger: persistLogger,
 	}, nil
 }
@@ -147,10 +148,10 @@ func (gsp *GameStatePersister) HandleGameStateUpdate(newMove *GameStateUpdate) (
 	}
 
 	if err := rs.PersistGraphToRedis(ctx, newAdjG, gameID, playerID); err != nil {
-		RetryFunc(func() error { return gsp.PersistGraphToRedis(ctx, newAdjG, gameID, playerID) })
+		RetryFunc(func() error { return rs.PersistGraphToRedis(ctx, newAdjG, gameID, playerID) })
 	}
 	if err := rs.PersistMoveToRedisList(ctx, newVert, gameID, playerID); err != nil {
-		RetryFunc(func() error { return gsp.PersistMoveToRedisList(ctx, newVert, gameID, playerID) })
+		RetryFunc(func() error { return rs.PersistMoveToRedisList(ctx, newVert, gameID, playerID) })
 	}
 
 	// cancel the context for this event handling
@@ -203,7 +204,7 @@ func RetryFunc(function func() error) error {
 	return err
 }
 
-func (gsp *GameStatePersister) PersistGraphToRedis(ctx context.Context, graph [][]int, gameID, playerID string) error {
+func (rs *RedisGameState) PersistGraphToRedis(ctx context.Context, graph [][]int, gameID, playerID string) error {
 	var serialized strings.Builder
 	for _, row := range graph {
 		for _, cell := range row {
@@ -214,7 +215,7 @@ func (gsp *GameStatePersister) PersistGraphToRedis(ctx context.Context, graph []
 
 	key := fmt.Sprintf("adjGraph:%s:%s", gameID, playerID)
 	serializedGraph := serialized.String()
-	_, err := gsp.redis.client.Set(ctx, key, serializedGraph, 0).Result()
+	_, err := rs.Set(ctx, key, serializedGraph, 0).Result()
 	if err != nil {
 		return err
 	}
@@ -222,10 +223,10 @@ func (gsp *GameStatePersister) PersistGraphToRedis(ctx context.Context, graph []
 	return nil
 }
 
-func (gsp *GameStatePersister) PersistMoveToRedisList(ctx context.Context, newMove Vertex, gameID, playerID string) error {
+func (rs *RedisGameState) PersistMoveToRedisList(ctx context.Context, newMove Vertex, gameID, playerID string) error {
 	moveKey := fmt.Sprintf("moveList:%s:%s", gameID, playerID)
 	serializedMove := fmt.Sprintf("%d,%d", newMove.X, newMove.Y)
-	_, err := gsp.redis.client.RPush(ctx, moveKey, serializedMove).Result()
+	_, err := rs.client.RPush(ctx, moveKey, serializedMove).Result()
 	if err != nil {
 		return err
 	}
@@ -243,6 +244,7 @@ func (gsp *GameStatePersister) FetchGameState(ctx context.Context, newVert Verte
 	moveList, err2 := rs.FetchPlayerMoves(ctx, gameID, playerID)
 
 	if err != nil || err2 != nil {
+		make([]slice, 
 		adjGraph, moveList, _, err = pg.FetchGS_sql(ctx, gameID, playerID, moveCounter)
 		if err != nil {
 			panic(err)

@@ -264,6 +264,8 @@ func main() {
 	eventCmdLogger.InfoLog(eventCmdCtx, "EventCmdLogger Initiated", zap.Bool("EventCmdLogger Activation", true))
 	errorLogger.InfoLog(errorLogCtx, "ErrorLogger Initiated", zap.Bool("ErrorLogger Activation", true))
 
+
+
 	client, err := getRedisClient(RedisAddr)
 	if err != nil {
 		errorLogger.ErrorLog(parentCtx, "Error getting Redis Client", zap.Bool("get redisClient", false))
@@ -277,9 +279,17 @@ func main() {
 
 	// Initialize command and event dispatchers
 	d := NewDispatcher(parentCtx, gsp, errorLogger, eventCmdLogger)
+	
+	
+	// initialize the workers and lobby
+	lobbyCtx, lobbyCancel := context.WithCancel(parentCtx)
+	numWorkers := 10
+	d.StartWorkerPool(lobbyCtx, lobbyCancel, numWorkers)
+
+
 
 	// Starts the command and event dispatchers's goroutines
-	d.Start(parentCtx)
+	d.StartDispatcher(parentCtx)
 
 	//....... some stuff?
 

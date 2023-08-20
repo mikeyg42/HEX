@@ -3,6 +3,7 @@ module github.com/mikeyg42/HEX
 go 1.20
 
 require (
+	github.com/bsm/gomega v1.26.0
 	github.com/go-redis/cache/v9 v9.0.0
 	github.com/google/uuid v1.3.0
 	github.com/redis/go-redis/v9 v9.0.5

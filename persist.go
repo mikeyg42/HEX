@@ -13,6 +13,7 @@ import (
 	redis "github.com/redis/go-redis/v9"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	cache "github.com/go-redis/cache/v9"
 )
 
 // .... INITIALIZE
@@ -34,9 +35,12 @@ func InitializePersistence(ctx context.Context) (*GameStatePersister, error, err
 		return nil, nil, nil, fmt.Errorf("InitError - Redis")
 	}
 
+	redisCache := InitializeCache(rgs.Client)
+
 	gsp := &GameStatePersister{
 		postgres: pgs,
 		redis:    rgs,
+		cache:    redisCache,
 	}
 
 	return gsp, nil, nil, nil
@@ -53,6 +57,19 @@ func InitializeRedis(persistLogger Logger) (*RedisGameState, error) {
 		TimeoutDur: 5 * time.Second, // duration
 	}
 	return rgs, err
+}
+
+// Initialize Redis client
+func getRedisClient(RedisAddress string) (*redis.Client, error) {
+	client := redis.NewClient(&redis.Options{
+		Addr:     RedisAddress,
+		Password: "",
+		DB:       0, // Default DB
+	})
+
+	_, err := client.Ping(context.TODO()).Result()
+
+	return client, err
 }
 
 func InitializePostgres(persistLogger Logger) (*PostgresGameState, error) {
@@ -94,6 +111,16 @@ func InitializePostgres(persistLogger Logger) (*PostgresGameState, error) {
 		Context:    context.Background(), //nrw one
 		TimeoutDur: time.Second * 10,
 	}, nil
+}
+
+func InitializeCache(redisClient *redis.Client) *cache.Cache {
+   // currently I'm only using the cache for the declaringMoveCmd handler, in order to determine whether or not a move as been made already 
+	redisCache := cache.New(&cache.Options{
+        Redis:      redisClient,
+        LocalCache: cache.NewTinyLFU(1000, time.Minute),
+    })
+
+	return redisCache
 }
 
 // PERSIST functions

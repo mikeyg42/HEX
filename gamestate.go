@@ -4,16 +4,10 @@ import (
 	"context"
 	"fmt"
 	"time"
+
 	zap "go.uber.org/zap"
 	"gorm.io/gorm"
 )
-
-// TO DO:
-
-// Confirm that everyone in the code is consistently using zero indexing for the xy coordinates of the board
-
-// you need to include logic to clarify if the adjacency graph and movelist are saved to player 1 or player 2
-// you need to figure out how to flip the board for player 2!!!!!
 
 type Vertex struct {
 	X int `json:"x" gorm:"type:integer"`
@@ -42,32 +36,29 @@ type MoveLog struct {
 const SideLenGameboard = 15
 const maxRetries = 3
 
+// ..... HANDLERS ............//
 
-// ..... HANDLER
-
-func (gsp *GameStatePersister) HandleGameStateUpdate(newMove *GameStateUpdate) (interface{}) {
+func (gsp *GameStatePersister) HandleGameStateUpdate(newMove *GameStateUpdate) interface{} {
 	pg := gsp.postgres
 	rs := gsp.redis
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
-	
+
 	playerID := newMove.PlayerID
-	
+
 	moveCounter := newMove.MoveCounter
 	gameID := newMove.GameID
 	xCoord := newMove.xCoordinate
 	yCoord := newMove.yCoordinate
 
-
 	// FIX THIS!!
 	yn_rotateboard := true
-	if moveCounter%2==0 {
-		yn_rotateboard = false 
+	if moveCounter%2 == 0 {
+		yn_rotateboard = false
 	}
 
-
 	newVert, err := convertToTypeVertex(xCoord, yCoord, yn_rotateboard)
-	if err != nil { 
+	if err != nil {
 		//handle
 	}
 	// retrieve adjacency matrix and movelist from redis, with postgres as fall back option
@@ -94,13 +85,13 @@ func (gsp *GameStatePersister) HandleGameStateUpdate(newMove *GameStateUpdate) (
 	cancelFunc()
 
 	if win_yn {
-	// use the lockedGames map to ascertain who opponent is (ie who's turn is next )
+		// use the lockedGames map to ascertain who opponent is (ie who's turn is next )
 		lg := allLockedGames[gameID] //check all lockedGames map
 		loserID := lg.Player1.PlayerID
 		if lg.Player1.PlayerID == playerID {
 			loserID = lg.Player2.PlayerID
 		}
-	
+
 		newCmd := &EndingGameCmd{
 			GameID:       gameID,
 			WinnerID:     playerID,
@@ -128,7 +119,6 @@ func (gsp *GameStatePersister) HandleGameStateUpdate(newMove *GameStateUpdate) (
 	// include a check to compare redis and postgres?
 }
 
-
 func RetryFunc(function func() error) error {
 	var lastErr error
 	for i := 0; i < maxRetries; i++ {
@@ -143,7 +133,6 @@ func RetryFunc(function func() error) error {
 	}
 	return fmt.Errorf("failed after %d attempts. Last error: %v", maxRetries, lastErr)
 }
-
 
 func (pg *PostgresGameState) RecreateGS_Postgres(ctx context.Context, playerID, gameID string, moveCounter int) ([][]int, []Vertex, error) {
 	// this function assumes that you have NOT yet incorporated the newest move into this postgres. but moveCounter input is that of the new move yet to be added
@@ -160,7 +149,7 @@ func (pg *PostgresGameState) RecreateGS_Postgres(ctx context.Context, playerID, 
 	if moveCounterCheck >= moveCounter {
 		// CHECK FOR DUPLICATE ENTRIES?
 
-		return nil, nil, fmt.Errorf("Found more moves than anticipated")
+		return nil, nil, fmt.Errorf("found more moves than anticipated")
 	}
 
 	if moveCounter == 1 || moveCounter == 2 {
@@ -168,7 +157,7 @@ func (pg *PostgresGameState) RecreateGS_Postgres(ctx context.Context, playerID, 
 		case 0:
 			return adjGraph, moveList, nil
 		case 1:
-			vert, err := convertToTypeVertex(xCoords[0], yCoords[0])
+			vert, err := convertToTypeVertex(xCoords[0], yCoords[0], false)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -181,13 +170,18 @@ func (pg *PostgresGameState) RecreateGS_Postgres(ctx context.Context, playerID, 
 	}
 
 	// Incorporate the moves
+	yn_rotateboard := true
+	if moveCounter%2 == 0 {
+		yn_rotateboard = false
+	}
+
 	for i := 0; i < len(xCoords); i++ {
-		vert, err := convertToTypeVertex(xCoords[i], yCoords[i])
+		modVert, err := convertToTypeVertex(xCoords[i], yCoords[i], yn_rotateboard)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		adjGraph, moveList = IncorporateNewVert(ctx, moveList, adjGraph, vert)
+		adjGraph, moveList = IncorporateNewVert(ctx, moveList, adjGraph, modVert)
 	}
 
 	return adjGraph, moveList, nil
@@ -273,7 +267,7 @@ func evalWinCondition(adjG [][]int, moveList []Vertex) bool {
 	}
 }
 
-// ..... Helper functions
+// ..... Helper functions ..... //
 
 func IncorporateNewVert(ctx context.Context, moveList []Vertex, adjGraph [][]int, newVert Vertex) ([][]int, []Vertex) {
 	// Update Moves
@@ -340,7 +334,7 @@ func thinAdjacencyMat(adj [][]int, indices []int) ([][]int, error) {
 
 	// Check for matrix symmetry
 	if isSymmetric(thinnedAdj) {
-		return nil, fmt.Errorf("gamestate breakdown", "Adjacency matrix is not symmetric, something went wrong, terribly wrong")
+		return nil, fmt.Errorf("gamestate breakdown: %v", "Adjacency matrix is not symmetric, something went wrong, terribly wrong")
 	}
 
 	return thinnedAdj, nil
@@ -449,7 +443,7 @@ func convertToTypeVertex(xCoord string, yCoord int, yes_rotate bool) (Vertex, er
 	if yes_rotate {
 		return Vertex{X: yCoord, Y: x}, nil
 	} else {
-		return Vertex{X:x , Y: yCoord}, nil
+		return Vertex{X: x, Y: yCoord}, nil
 	}
 }
 

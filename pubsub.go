@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
+	cache "github.com/go-redis/cache/v9"
 	redis "github.com/redis/go-redis/v9"
-
 	zap "go.uber.org/zap"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
@@ -21,22 +21,14 @@ import (
 
 // ................ events ......................//
 var eventTypeMap = map[string]interface{}{
-	"GameAnnouncementEvent": &GameAnnouncementEvent{},
-	"DeclaredMoveEvent":     &DeclaredMoveEvent{},
-	"InvalidMoveEvent":      &InvalidMoveEvent{},
-	"OfficialMoveEvent":     &OfficialMoveEvent{},
-	"GameStateUpdate":       &GameStateUpdate{},
-	"GameStartEvent":        &GameStartEvent{},
-	"NextTurnStartsEvent":   &NextTurnStartsEvent{},
-}
-
-type NextTurnStartsEvent struct {
-	Event
-	GameID             string
-	PriorPlayerID      string
-	NextPlayerID       string
-	UpcomingMoveNumber int
-	TimeStamp          time.Time
+	"GameAnnouncementEvent":        &GameAnnouncementEvent{},
+	"DeclaredMoveEvent":            &DeclaredMoveEvent{},
+	"InvalidMoveEvent":             &InvalidMoveEvent{},
+	"OfficialMoveEvent":            &OfficialMoveEvent{},
+	"GameStateUpdate":              &GameStateUpdate{},
+	"GameStartEvent":               &GameStartEvent{},
+	"GameEndedEvent":               &GameEndedEvent{},
+	"TimerON_StartTurnAnnounceEvt": &TimerON_StartTurnAnnounceEvt{},
 }
 
 type GameAnnouncementEvent struct {
@@ -63,10 +55,20 @@ type InvalidMoveEvent struct {
 }
 
 type GameStartEvent struct {
+	Event
 	GameID         string
 	FirstPlayerID  string
 	SecondPlayerID string
 	Timestamp      time.Time
+}
+
+type TimerON_StartTurnAnnounceEvt struct {
+	Event
+	GameID         string
+	ActivePlayerID string
+	TurnStartTime  time.Time
+	TurnEndTime    time.Time
+	MoveNumber     int
 }
 
 type OfficialMoveEvent struct {
@@ -87,6 +89,14 @@ type GameStateUpdate struct {
 	yCoordinate int
 
 	ConcatenatedMove string `redis:"-"`
+}
+
+type GameEndedEvent struct {
+	Event
+	GameID       string `json:"gameId"`
+	WinnerID     string `json:"winnerId"`
+	LoserID      string `json:"loserId"`
+	WinCondition string `json:"moveData"`
 }
 
 // ...................... game Lock ......................//
@@ -111,14 +121,16 @@ var cmdTypeMap = map[string]interface{}{
 	"PlayerForfeitingCmd": &PlayerForfeitingCmd{},
 	"UpdatingCmd":         &UpdatingCmd{},
 	"StartNextTurnCmd":    &StartNextTurnCmd{},
-	"EndingGameCmd":         &EndingGameCmd{},
+	"NextTurnStartingCmd": &NextTurnStartingCmd{},
 }
-type EndingGameCmd struct {
+
+type NextTurnStartingCmd struct {
 	Command
-	GameID       string `json:"gameId"`
-	WinnerID     string `json:"winnerId"`
-	LoserID      string `json:"loserId"`
-	WinCondition string `json:"moveData"`
+	GameID             string
+	PriorPlayerID      string
+	NextPlayerID       string
+	UpcomingMoveNumber int
+	TimeStamp          time.Time
 }
 
 type DeclaringMoveCmd struct {
@@ -145,7 +157,6 @@ type StartNextTurnCmd struct {
 	Timestamp    time.Time
 }
 
-// maybe should be  an event
 type LetsStartTheGameCmd struct {
 	Command
 	GameID         string    `json:"gameId"`
@@ -189,8 +200,10 @@ type Command interface {
 const shortDur = 1 * time.Second
 
 type PostgresGameState struct {
-	DB     *gorm.DB
-	logger Logger
+	DB         *gorm.DB
+	Logger     Logger
+	Context    context.Context
+	TimeoutDur time.Duration
 }
 
 var (
@@ -199,8 +212,11 @@ var (
 )
 
 type RedisGameState struct {
-	client *redis.Client
-	logger Logger
+	Client     *redis.Client
+	MyCache    *cache.Cache
+	Logger     Logger
+	Context    context.Context
+	TimeoutDur time.Duration
 }
 
 type GameStatePersister struct {
@@ -264,34 +280,29 @@ func main() {
 	eventCmdLogger.InfoLog(eventCmdCtx, "EventCmdLogger Initiated", zap.Bool("EventCmdLogger Activation", true))
 	errorLogger.InfoLog(errorLogCtx, "ErrorLogger Initiated", zap.Bool("ErrorLogger Activation", true))
 
-
-
-	client, err := getRedisClient(RedisAddr)
-	if err != nil {
-		errorLogger.ErrorLog(parentCtx, "Error getting Redis Client", zap.Bool("get redisClient", false))
-		return
+	gsp, LogErr, RedisErr, PostgresErr := InitializePersistence(persistCtx)
+	if LogErr != nil {
+		errorLogger.ErrorLog(parentCtx, "Error initializing persistence", zap.Bool("initialize persistence", false), zap.String("errorSource", "Logger"))
 	}
-
-	gsp, err := InitializePersistence(persistCtx)
-	if err != nil {
-		errorLogger.ErrorLog(parentCtx, "Error initializing persistence", zap.Bool("initialize persistence", false))
+	if RedisErr != nil {
+		errorLogger.ErrorLog(parentCtx, "Error initializing persistence", zap.Bool("initialize persistence", false), zap.String("errorSource", "REDIS"))
+	}
+	if PostgresErr != nil {
+		errorLogger.ErrorLog(parentCtx, "Error initializing persistence", zap.Bool("initialize persistence", false), zap.String("errorSource", "PostgresQL"))
 	}
 
 	// Initialize command and event dispatchers
 	d := NewDispatcher(parentCtx, gsp, errorLogger, eventCmdLogger)
-	
-	
+
 	// initialize the workers and lobby
 	lobbyCtx, lobbyCancel := context.WithCancel(parentCtx)
 	numWorkers := 10
-	d.StartWorkerPool(lobbyCtx, lobbyCancel, numWorkers)
-
-
+	d.StartNewWorkerPool(lobbyCtx, lobbyCancel, numWorkers)
 
 	// Starts the command and event dispatchers's goroutines
 	d.StartDispatcher(parentCtx)
 
-	//....... some stuff?
+	//....... some stuff? this should all go in the graceful shutdown function
 
 	// flush logger queues I think?
 	eventCmdLogger.ZapLogger.Sync()
@@ -299,10 +310,17 @@ func main() {
 	persistLogger.ZapLogger.Sync()
 
 	// Close the Redis client
-	err = client.Close()
+	err := gsp.redis.Client.Close()
 	if err != nil {
 		errorLogger.ErrorLog(parentCtx, "Error closing Redis client:", zap.Bool("close redis client", false), zap.Error(err))
 	}
+
+	// Close the Postgres client
+	sqlDB, err := gsp.postgres.DB.DB()
+	if err != nil {
+		errorLogger.ErrorLog(parentCtx, "Error closing postgresql connection using generic sqlDB method", zap.Bool("close postgres connection", false), zap.Error(err))
+	}
+	sqlDB.Close()
 
 	// cancel the parent context, canceling all children too
 	parentCancelFunc()
@@ -316,8 +334,8 @@ func main() {
 func getRedisClient(RedisAddress string) (*redis.Client, error) {
 	client := redis.NewClient(&redis.Options{
 		Addr:     RedisAddress,
-		Password: "", // Redis password if required
-		DB:       0,  // Default DB
+		Password: "",
+		DB:       0, // Default DB
 	})
 
 	_, err := client.Ping(context.TODO()).Result()
@@ -348,8 +366,10 @@ func (d *Dispatcher) handleEvent(done <-chan struct{}, event Event, eventPubSub 
 	case *InvalidMoveEvent:
 		d.errorLogger.Warn(ctx, "Received InvalidMoveEvent: %v", event)
 
+
 	case *OfficialMoveEvent:
-		d.eventCmdLogger.Info(ctx, event.GameID+"/"+event.PlayerID+" has made a move: "+event.MoveData)
+		strs := []string{event.GameID, event.PlayerID, "has made a move:", event.MoveData}
+		d.eventCmdLogger.Info(ctx, strings.Join(strs, "/"))
 
 		// To get here means the player's move was valid! Therefore, we can stop their countdown. we will start new one after processing this move
 		d.timer.StopTimer()
@@ -360,22 +380,14 @@ func (d *Dispatcher) handleEvent(done <-chan struct{}, event Event, eventPubSub 
 
 	case *GameStateUpdate:
 		// Persist the data and check win conditions
-		newEvt, yesEvt := d.persister.HandleGameStateUpdate(event)
-		
-		// If yesEvt is true, then the handler will output an event, namely, nextTurnStartsEvent	
-		if yesEvt {
-			d.EventDispatcher(newEvt)
-		} else {
-			d.CommandDispatcher(newEvt)
-		}
-		d.timer.StopTimer() //always do this before starting timer again to ensure that the
+		newCmd := d.persister.HandleGameStateUpdate(event)
 
-	case *NextTurnStartsEvent:
-		d.eventCmdLogger.Info(ctx, "NextTurnStartsEvent received for game: "+event.GameID)
-		d.timer.StartTimer()
+		d.CommandDispatcher(newCmd)
+
+		d.timer.StopTimer() //always do this before starting timer again to ensure that the timer is flushed. It doesnt hurt to stop repeatedly.
 
 	default:
-		d.errorLogger.Error(ctx, "Unknown event type: %v", fmt.Errorf("Weird event type: %T", event))
+		d.errorLogger.Error(ctx, "unknown event type: %v", fmt.Errorf("weird event type: %v", event))
 		d.eventCmdLogger.Info(ctx, "Received Unusual, unknown event: %v", event)
 	}
 	return nil
@@ -386,23 +398,11 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 	defer cancel()
 
 	switch cmd := cmd.(type) {
-
-	case *GameEndingCmd:
-		d.timer.StopTimer()
-		d.eventCmdLogger.Info(ctx, cmd.GameID+" is over", zap.String("Winner", cmd.WinnerID), zap.String("Loser", cmd.LoserID), zap.String("WinCondition", cmd.WinCondition))
-
-		// clear redis 
-		
-
-		gracefullyShutDownGame()
-		commandPubSub.Close()
-
 	case *DeclaringMoveCmd:
-		xcoords, ycoords, lastPostgresCounter, err := d.persister.postgres.FetchGS_sql(ctx, cmd.GameID, "all")
-		if err != nil {
-			d.persister.postgres.logger.ErrorLog(ctx, "Error fetching game state from persistence", zap.Error(err))
-			return
-		}
+	
+		// YOU NEED TO FINISH THIS 
+		lockedGame, ok := allLockedGames[cmd.GameID]
+		
 
 		moveData := cmd.DeclaredMove
 		moveParts := strings.Split(moveData, ".")
@@ -413,8 +413,34 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 			return
 		}
 
-		new_val := moveParts[2]
-		validMove := true
+		new_val := moveParts[2] // new_val is the concatenated x and y coordinates of the most recent move
+		xcoord := new_val[0]
+		ycoord := new_val[1]
+
+		pipe := d.persister.redis.Client.Pipeline()
+
+		// Prepare commands for moves1 and moves2
+		getMoves1 := pipe.HGetAll(ctx, fmt.Sprintf("MoveList:%s:%s", cmd.GameID, lockedGame.Player1.PlayerID))
+		getMoves2 := pipe.HGetAll(ctx, fmt.Sprintf("MoveList:%s:%s", cmd.GameID, lockedGame.Player2.PlayerID))
+		
+		// Execute pipelined commands
+		_, err := pipe.Exec(ctx)
+		if err != nil {
+			// handle error
+		}
+		
+		// Fetch results
+		moves1, err1 := getMoves1.Result()
+		moves2, err2 := getMoves2.Result()
+		if err1 != nil || err2 != nil {
+			//l log error then go to postgresql
+		}
+		//combime moves1 and moves2
+		for key, value := range moves2 {
+			moves1[key] = value
+		}
+	
+			
 
 		coordMap, reversedMap, err := createCoordMaps(xcoords, ycoords)
 		if err != nil {
@@ -423,6 +449,7 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 		}
 
 		// Verify move
+		validMove := true
 		if _, ok := coordMap[new_key]; ok {
 			d.errorLogger.InfoLog(ctx, "Duplicate moveCounter in AcceptedMoves list", zap.String("DuplicateMoveNumber", moveData))
 			validMove = false
@@ -449,35 +476,57 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 		}
 		d.EventDispatcher(newEvent)
 
+	case *NextTurnStartingCmd:
+
+		d.eventCmdLogger.Info(ctx, fmt.Sprintf("NextTurnStartingCmd received for game : %s",cmd.GameID))
+
+		// Only Place you start the timer!
+		d.timer.StartTimer()
+
+		startTime := time.Now()
+		endTime := startTime.Add(moveTimeout)
+
+		newEvt := &TimerON_StartTurnAnnounceEvt{
+			GameID:         cmd.GameID,
+			ActivePlayerID: cmd.NextPlayerID,
+			TurnStartTime:  startTime,
+			TurnEndTime:    endTime,
+			MoveNumber:     cmd.UpcomingMoveNumber,
+		}
+		d.EventDispatcher(newEvt)
+
 	case *PlayerForfeitingCmd:
 
 		d.eventCmdLogger.Info(ctx, "Player forfeited the game", zap.String("PlayerID", cmd.SourcePlayerID), zap.String("GameID", cmd.GameID), zap.String("ForfeitReason", cmd.Reason))
 
 		d.timer.StopTimer()
 
-		// Determine who the winner is via the allLockedGames struct and the PlayerForfeitingCmd
+		// Determine who the winner is via the allLockedGames struct
 		lg := allLockedGames[cmd.GameID]
-		var newCmd *EndingGameCmd
+		var newEvt *GameEndedEvent
+		
+		winCond := []string{"Forfeit: ",cmd.Reason}
+		winCondition := strings.Join(winCond,"")
 
 		if cmd.SourcePlayerID == lg.Player1.PlayerID {
-			newCmd = &EndingGameCmd{
+			newEvt = &GameEndedEvent{
 				GameID:       cmd.GameID,
 				LoserID:      cmd.SourcePlayerID,
 				WinnerID:     lg.Player2.PlayerID,
-				WinCondition: "Forfeit: " + cmd.Reason,
+				WinCondition: winCondition,
 			}
 		} else if cmd.SourcePlayerID == lg.Player2.PlayerID {
-			newCmd = &EndingGameCmd{
+			newEvt = &GameEndedEvent{
 				GameID:       cmd.GameID,
 				LoserID:      cmd.SourcePlayerID,
 				WinnerID:     lg.Player1.PlayerID,
-				WinCondition: "Forfeit: " + cmd.Reason,
+				WinCondition: winCondition,
 			}
 		} else {
 			d.errorLogger.ErrorLog(ctx, "Error parsing the winner from AllLockedGames global", zap.String("LoserID", cmd.SourcePlayerID), zap.String("GameID", cmd.GameID), zap.String("ForfeitReason", cmd.Reason))
 		}
-		d.CommandDispatcher(newCmd)
- 
+		d.EventDispatcher(newEvt)
+
 	case *LetsStartTheGameCmd: // this command is generated by the LockTheGame function found in the workerpool code
 
 		// Create a new channel for this game instance
@@ -504,6 +553,7 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 
 		d.EventDispatcher(startEvent)
 
+		// MAKE THE TIMER AND START IT INITIALLY
 		d.timer = MakeNewTimer()
 		d.timer.startChan <- struct{}{}
 
@@ -533,7 +583,7 @@ func (d *Dispatcher) parseOfficialMoveEvt(ctx context.Context, e *OfficialMoveEv
 
 	coordinates := moveParts[2]
 	if len(coordinates) < 2 {
-		return nil, fmt.Errorf("invalid coordinates format")
+		return nil, fmt.Errorf("missing at least part of the coordinates")
 	}
 
 	xCoordinate := coordinates[:1]
@@ -569,10 +619,12 @@ func createCoordMaps(xCoords []string, yCoords []int) (map[int]string, map[strin
 
 	resultMap := make(map[int]string, len(xCoords))
 	reverseMap := make(map[string]int, len(xCoords))
+
 	for i, x := range xCoords {
-		coordPair := x + strconv.Itoa(yCoords[i])
-		resultMap[i+1] = coordPair
-		reverseMap[coordPair] = i + 1
+		coordPair := []string{x, strconv.Itoa(yCoords[i])}
+		resultMap[i+1] = strings.Join(coordPair, "")
+		reverseMap[resultMap[i+1]] = i + 1
 	}
 	return resultMap, reverseMap, nil
 }
+

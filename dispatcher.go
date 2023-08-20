@@ -66,7 +66,7 @@ func (d *Dispatcher) commandDispatcher(ctx context.Context, errChan chan<- error
 		}
 
 		// Publish command to Redis Pub/Sub channel
-		err = d.persister.redis.client.Publish(ctx, "commands", payload).Err()
+		err = d.persister.redis.Client.Publish(ctx, "commands", payload).Err()
 		if err != nil {
 			errChan <- err
 		}
@@ -87,7 +87,7 @@ func (d *Dispatcher) eventDispatcher(ctx context.Context, errChan chan<- error) 
 		}
 
 		// Publish event to Redis Pub/Sub channel
-		err = d.persister.redis.client.Publish(ctx, "events", payload).Err()
+		err = d.persister.redis.Client.Publish(ctx, "events", payload).Err()
 		if err != nil {
 			errChan <- err
 		}
@@ -98,7 +98,7 @@ func (d *Dispatcher) eventDispatcher(ctx context.Context, errChan chan<- error) 
 // subscribeToCommands with error channel
 func (d *Dispatcher) subscribeToCommands(done <-chan struct{}, errChan chan<- error) {
 	ctx, cancelFunc := context.WithCancel(context.Background())
-	commandPubSub := d.persister.redis.client.Subscribe(ctx, "commands")
+	commandPubSub := d.persister.redis.Client.Subscribe(ctx, "commands")
 	defer cancelFunc()
 	defer commandPubSub.Close()
 
@@ -144,7 +144,7 @@ func (d *Dispatcher) subscribeToCommands(done <-chan struct{}, errChan chan<- er
 // subscribeToEvents with error channel
 func (d *Dispatcher) subscribeToEvents(done <-chan struct{}, errChan chan<- error) {
 	ctx, cancelFunc := context.WithCancel(context.Background())
-	eventPubSub := d.persister.redis.client.Subscribe(ctx, "events")
+	eventPubSub := d.persister.redis.Client.Subscribe(ctx, "events")
 	defer eventPubSub.Close()
 	defer cancelFunc()
 

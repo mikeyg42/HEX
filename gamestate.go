@@ -2,22 +2,16 @@ package main
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"fmt"
-	"os"
-	"strings"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 	zap "go.uber.org/zap"
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
 // TO DO:
 
 // Confirm that everyone in the code is consistently using zero indexing for the xy coordinates of the board
+
 // you need to include logic to clarify if the adjacency graph and movelist are saved to player 1 or player 2
 // you need to figure out how to flip the board for player 2!!!!!
 
@@ -48,108 +42,50 @@ type MoveLog struct {
 const SideLenGameboard = 15
 const maxRetries = 3
 
-// /.... INITIALIZE
-func InitializePersistence(ctx context.Context) (*GameStatePersister, error) {
-	persistLogger, ok := ctx.Value(persistLoggerKey{}).(Logger)
-	if !ok {
-		return nil, fmt.Errorf("error getting logger from context")
-	}
-
-	gsp, err := createGameStatePersist(ctx, persistLogger)
-	if err != nil {
-		persistLogger.ErrorLog(ctx, "error creating postgres persister", zap.Error(err))
-		return nil, fmt.Errorf("error creating postgres persister: %w", err)
-	}
-
-	return gsp, nil
-}
-
-func InitializePostgres(ctx context.Context, persistLogger Logger) (*PostgresGameState, error) {
-
-	//a data source name is made that tells postgresql where to connect to
-	dsn := fmt.Sprintf(
-		"host=db user=%s password=%s dbname=%s port=5432 sslmode=disable TimeZone=America/New_York",
-		os.Getenv("DB_USER"),
-		os.Getenv("DB_PASSWORD"),
-		os.Getenv("DB_NAME"),
-	)
-	// using the dsn and the gorm config file we open a connection to the database
-	db, err := gorm.Open(postgres.New(postgres.Config{
-		DSN:                  dsn,
-		PreferSimpleProtocol: true,
-	}), &gorm.Config{
-		Logger: persistLogger,
-	})
-	if err != nil {
-		persistLogger.ErrorLog(ctx, "CANNOT CONNECT TO GORM DB", zap.Error(err))
-		return nil, err
-	}
-
-	// sqlDB is a lower level of abstraction but is a reference to the same underlying sql.DB struct that GORM is using, so modifying sqlDB changes the gorm postgres DB
-	sqlDB, err := db.DB()
-	if err != nil {
-		persistLogger.ErrorLog(ctx, "error defining lower-level referece to database/sql", zap.Error(err))
-		return nil, err
-	}
-	sqlDB.SetMaxIdleConns(20)
-	sqlDB.SetMaxOpenConns(200)
-	sqlDB.SetConnMaxIdleTime(time.Minute * 5)
-
-	// using automigrate with this empty gamestateupdate creates the relational database table for us if it doesn't already exist
-	db.AutoMigrate(&MoveLog{})
-
-	// declare DB as a PostgresGameState
-	return &PostgresGameState{
-		DB:     db,
-		logger: persistLogger,
-	}, nil
-}
-
-func createGameStatePersist(ctx context.Context, persistLogger Logger) (*GameStatePersister, error) {
-
-	redisClient := InitializeRedis(ctx)
-	pgs, err := InitializePostgres(ctx)
-
-	return &GameStatePersister{
-		postgres: pgs,
-		redis: &RedisGameState{
-			redisClient,
-			persistLogger,
-		},
-	}, err
-}
 
 // ..... HANDLER
 
-func (gsp *GameStatePersister) HandleGameStateUpdate(newMove *GameStateUpdate) (interface{}, bool) {
+func (gsp *GameStatePersister) HandleGameStateUpdate(newMove *GameStateUpdate) (interface{}) {
 	pg := gsp.postgres
 	rs := gsp.redis
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
+	
 	playerID := newMove.PlayerID
+	
 	moveCounter := newMove.MoveCounter
 	gameID := newMove.GameID
 	xCoord := newMove.xCoordinate
 	yCoord := newMove.yCoordinate
 
-	newVert, err := convertToTypeVertex(xCoord, yCoord)
-	if err != nil {
+
+	// FIX THIS!!
+	yn_rotateboard := true
+	if moveCounter%2==0 {
+		yn_rotateboard = false 
+	}
+
+
+	newVert, err := convertToTypeVertex(xCoord, yCoord, yn_rotateboard)
+	if err != nil { 
 		//handle
 	}
 	// retrieve adjacency matrix and movelist from redis, with postgres as fall back option
-	oldAdjG, oldMoveList := rs.FetchGameState(ctx, newVert, gameID, playerID, moveCounter)
+	oldAdjG, oldMoveList := gsp.FetchGameState(ctx, newVert, gameID, playerID, moveCounter)
 	newAdjG, newMoveList := IncorporateNewVert(ctx, oldMoveList, oldAdjG, newVert)
 
+	// DONE UPDATING GAMESTATE! NOW WE USE IT
 	win_yn := evalWinCondition(newAdjG, newMoveList)
-
-	err = pg.UpdateGS_sql(ctx, newMove)
+	// ... AND SAVE IT
+	err = pg.PersistGameState_sql(ctx, newMove)
 	if err != nil {
 		// Handle the error
 	}
-
+	// adjacency matrix
 	if err := rs.PersistGraphToRedis(ctx, newAdjG, gameID, playerID); err != nil {
 		RetryFunc(func() error { return rs.PersistGraphToRedis(ctx, newAdjG, gameID, playerID) })
 	}
+	// move List
 	if err := rs.PersistMoveToRedisList(ctx, newVert, gameID, playerID); err != nil {
 		RetryFunc(func() error { return rs.PersistMoveToRedisList(ctx, newVert, gameID, playerID) })
 	}
@@ -157,20 +93,21 @@ func (gsp *GameStatePersister) HandleGameStateUpdate(newMove *GameStateUpdate) (
 	// cancel the context for this event handling
 	cancelFunc()
 
-	loserID := lg.Player1.PlayerID
-	lg := allLockedGames[gameID] //check all lockedGames map
-	if lg.Player1.PlayerID == playerID {
-		loserID = lg.Player2.PlayerID
-	}
-
 	if win_yn {
-		newEvt := &EndingGameCmd{
+	// use the lockedGames map to ascertain who opponent is (ie who's turn is next )
+		lg := allLockedGames[gameID] //check all lockedGames map
+		loserID := lg.Player1.PlayerID
+		if lg.Player1.PlayerID == playerID {
+			loserID = lg.Player2.PlayerID
+		}
+	
+		newCmd := &EndingGameCmd{
 			GameID:       gameID,
 			WinnerID:     playerID,
 			LoserID:      loserID,
 			WinCondition: "A True Win",
 		}
-		return newEvt, false
+		return newCmd
 
 	} else {
 		nextPlayer := "P2"
@@ -178,201 +115,35 @@ func (gsp *GameStatePersister) HandleGameStateUpdate(newMove *GameStateUpdate) (
 			nextPlayer = "P1"
 		}
 
-		newEvt := &NextTurnStartsEvent{
-			GameID:   gameID,
-			PriorPlayerID: playerID,
-			NextPlayerID: nextPlayer,
+		newCmd := &NextTurnStartingCmd{
+			GameID:             gameID,
+			PriorPlayerID:      playerID,
+			NextPlayerID:       nextPlayer,
 			UpcomingMoveNumber: moveCounter + 1,
-			TimeStamp: 	time.Now(),
+			TimeStamp:          time.Now(),
 		}
-		return newEvt, true
+		return newCmd
 	}
-
-	
 
 	// include a check to compare redis and postgres?
 }
 
+
 func RetryFunc(function func() error) error {
-	var err error
+	var lastErr error
 	for i := 0; i < maxRetries; i++ {
-		err = function()
-		if err == nil {
+		if lastErr = function(); lastErr == nil {
 			return nil
 		}
+		// Log the error
+		fmt.Printf("Attempt %d failed with error: %v. Retrying...\n", i+1, lastErr)
+
+		// Introduce a delay with exponential backoff
+		time.Sleep(time.Second * time.Duration(1<<i))
 	}
-	return err
+	return fmt.Errorf("failed after %d attempts. Last error: %v", maxRetries, lastErr)
 }
 
-func (rs *RedisGameState) PersistGraphToRedis(ctx context.Context, graph [][]int, gameID, playerID string) error {
-	var serialized strings.Builder
-	for _, row := range graph {
-		for _, cell := range row {
-			serialized.WriteString(fmt.Sprintf("%d,", cell))
-		}
-		serialized.WriteString(";")
-	}
-
-	key := fmt.Sprintf("adjGraph:%s:%s", gameID, playerID)
-	serializedGraph := serialized.String()
-	_, err := rs.Set(ctx, key, serializedGraph, 0).Result()
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (rs *RedisGameState) PersistMoveToRedisList(ctx context.Context, newMove Vertex, gameID, playerID string) error {
-	moveKey := fmt.Sprintf("moveList:%s:%s", gameID, playerID)
-	serializedMove := fmt.Sprintf("%d,%d", newMove.X, newMove.Y)
-	_, err := rs.client.RPush(ctx, moveKey, serializedMove).Result()
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// ..... FETCHING FROM REDIS
-func (gsp *GameStatePersister) FetchGameState(ctx context.Context, newVert Vertex, gameID, playerID string, moveCounter int) ([][]int, []Vertex) {
-
-	pg := gsp.postgres
-	rs := gsp.redis
-
-	adjGraph, err := rs.FetchAdjacencyGraph(ctx, gameID, playerID)
-	moveList, err2 := rs.FetchPlayerMoves(ctx, gameID, playerID)
-
-	if err != nil || err2 != nil {
-		make([]slice, 
-		adjGraph, moveList, _, err = pg.FetchGS_sql(ctx, gameID, playerID, moveCounter)
-		if err != nil {
-			panic(err)
-		}
-	}
-
-	return adjGraph, moveList
-}
-
-func (rs *RedisGameState) FetchPlayerMoves(ctx context.Context, gameID, playerID string) ([]Vertex, error) {
-	// Construct the key for fetching the list of moves.
-	movesKey := fmt.Sprintf("%s:%s:Moves", gameID, playerID)
-
-	emptyVal := []Vertex{}
-
-	// Fetch all moves from Redis using LRange.
-	movesJSON, err := rs.client.LRange(ctx, movesKey, 0, -1).Result()
-	if err != nil {
-		// Handle the error.
-		return emptyVal, err
-	}
-
-	// Decode each move from its JSON representation.
-	var moves []Vertex
-	for _, moveStr := range movesJSON {
-		var move Vertex
-		err = json.Unmarshal([]byte(moveStr), &move)
-		if err != nil {
-			// Handle the error. Depending on your application, you might want to continue to the next move or exit early.
-			return emptyVal, err
-		}
-		moves = append(moves, move)
-	}
-
-	return moves, nil
-}
-
-func (rs *RedisGameState) FetchAdjacencyGraph(ctx context.Context, gameID, playerID string) ([][]int, error) {
-	// Construct the key for fetching the adjacency graph.
-	adjacencyGraphKey := fmt.Sprintf("%s:%s:AdjacencyGraph", gameID, playerID)
-
-	emptyVal := [][]int{{0, 0}, {0, 0}}
-
-	// Fetch the adjacency graph from Redis.
-	adjacencyGraphJSON, err := rs.client.Get(ctx, adjacencyGraphKey).Result()
-	if err != nil {
-		// Handle the error. It's common for the error to be `redis.Nil` if the key doesn't exist.
-		return emptyVal, err
-	}
-
-	// Decode the adjacency graph from its JSON representation.
-	var adjacencyGraph [][]int
-	err = json.Unmarshal([]byte(adjacencyGraphJSON), &adjacencyGraph)
-	if err != nil {
-		return emptyVal, err
-	}
-
-	return adjacencyGraph, nil
-}
-
-// FETCH FROM POSTGRESQL
-
-func (pg *PostgresGameState) FetchGS_sql(ctx context.Context, gameID, playerID string) ([]string, []int, int, error) {
-	var moveLogs []MoveLog
-
-	if playerID == "all" { // this is called by the DeclaringMoveCommand handler
-		result := pg.DB.Where("game_id = ?", gameID).Order("move_counter asc").Find(&moveLogs)
-		if result.Error != nil {
-			return nil, nil, 0, result.Error
-		}
-	} else {
-		result := pg.DB.Where("game_id = ? AND player_id = ?", gameID, playerID).Order("move_counter asc").Find(&moveLogs)
-		if result.Error != nil {
-			return nil, nil, 0, result.Error
-		}
-	}
-
-	numMoves := len(moveLogs)
-	moveCounter := numMoves * 2
-	if playerID == "P1" {
-		moveCounter = moveCounter - 1
-	} else if playerID == "all" {
-		moveCounter = numMoves
-	}
-
-	xCoords := make([]string, numMoves)
-	yCoords := make([]int, numMoves)
-
-	for i, move := range moveLogs {
-		xCoords[i] = move.xCoordinate
-		yCoords[i] = move.yCoordinate
-	}
-
-	return xCoords, yCoords, moveCounter, nil
-}
-
-// ..... UPDATING POSTGRESQL
-
-func (pg *PostgresGameState) UpdateGS_sql(ctx context.Context, update *GameStateUpdate) error {
-
-	txOptions := &sql.TxOptions{
-		Isolation: sql.LevelSerializable,
-	}
-	tx := pg.DB.WithContext(ctx).Begin(txOptions)
-	if tx.Error != nil {
-		return tx.Error
-	}
-
-	moveLog := MoveLog{
-		GameID:      update.GameID,
-		PlayerID:    update.PlayerID,
-		MoveCounter: update.MoveCounter,
-		xCoordinate: update.xCoordinate,
-		yCoordinate: update.yCoordinate,
-	}
-
-	// Save the move to the MoveLog table.
-	if err := tx.Create(&moveLog).Error; err != nil {
-		tx.Rollback()
-		return err
-	}
-
-	if err := tx.Commit().Error; err != nil {
-		return err
-	}
-
-	return nil
-}
 
 func (pg *PostgresGameState) RecreateGS_Postgres(ctx context.Context, playerID, gameID string, moveCounter int) ([][]int, []Vertex, error) {
 	// this function assumes that you have NOT yet incorporated the newest move into this postgres. but moveCounter input is that of the new move yet to be added
@@ -498,7 +269,7 @@ func evalWinCondition(adjG [][]int, moveList []Vertex) bool {
 				return false
 			}
 		}
-		//If we make it to here then we have not thinned enough, and so we go forward with the next iteration of thinning
+		//If we make it to here then we have not thinned enough, and so we proceed with another iteration of thinning
 	}
 }
 
@@ -670,16 +441,17 @@ func convertToInt(xCoord string) (int, error) {
 	return int(xCoord[0]) - int('A'), nil
 }
 
-func convertToTypeVertex(xCoord string, yCoord int) (Vertex, error) {
+func convertToTypeVertex(xCoord string, yCoord int, yes_rotate bool) (Vertex, error) {
 	x, err := convertToInt(xCoord)
 	if err != nil {
 		return Vertex{}, err
 	}
-
-	return Vertex{X: x, Y: yCoord}, nil
+	if yes_rotate {
+		return Vertex{X: yCoord, Y: x}, nil
+	} else {
+		return Vertex{X:x , Y: yCoord}, nil
+	}
 }
-
-// vv maybe I dont need these any more!!!
 
 func largestKey(m []string) int {
 	maxKey := 0

@@ -3,13 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
-	"strings"
-	"strconv"
 
 	"github.com/google/uuid"
 	redis "github.com/redis/go-redis/v9"
+	zap "go.uber.org/zap"
 )
 
 var allLockedGames = make(map[string]LockedGame)
@@ -36,9 +37,9 @@ func GenerateUniqueGameID(db *PostgresGameState, w *Worker) (string, error) {
 }
 
 func Delete(gameID string) {
-    lockMutex.Lock()
-    delete(allLockedGames, gameID) // Remove the game from the map
-    lockMutex.Unlock()
+	lockMutex.Lock()
+	delete(allLockedGames, gameID) // Remove the game from the map
+	lockMutex.Unlock()
 }
 
 // Define the acknowledgment map and mutex
@@ -71,174 +72,174 @@ func isGameAcknowledged(gameID, playerID string) bool {
 	return true
 }
 
-
 func LockTheGame(d *Dispatcher, lg LockedGame) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)// for example, 1 minute timeout
-    defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute) // for example, 1 minute timeout
+	defer cancel()
 
-    ackCount := 0
-    var wg sync.WaitGroup
-    wg.Add(2)
-
-	go func() {
-        defer wg.Done()
-        select {
-        case <-ctx.Done():
-            return
-        default:
-            if isGameAcknowledged(lg.GameID, lg.Player1.PlayerID) {
-                ackCount++
-            }
-        }
-    }()
+	ackCount := 0
+	var wg sync.WaitGroup
+	wg.Add(2)
 
 	go func() {
-        defer wg.Done()
-        select {
-        case <-ctx.Done():
-            return
-        default:
-            if isGameAcknowledged(lg.GameID, lg.Player2.PlayerID) {
-                ackCount++
-            }
-        }
-    }()
+		defer wg.Done()
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			if isGameAcknowledged(lg.GameID, lg.Player1.PlayerID) {
+				ackCount++
+			}
+		}
+	}()
 
-    wg.Wait()
+	go func() {
+		defer wg.Done()
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			if isGameAcknowledged(lg.GameID, lg.Player2.PlayerID) {
+				ackCount++
+			}
+		}
+	}()
 
-    if ackCount == 2 {
-        // Both acknowledged, start the game
-        newCmd := &LetsStartTheGameCmd{
-            GameID:    lg.GameID,
-            Player1:   lg.Player1.PlayerID,
-            Player2:   lg.Player2.PlayerID,
-            Timestamp: time.Now(),
-        }
-        d.CommandDispatcher(newCmd)
+	wg.Wait()
 
-    } else {
-        // Players didn't acknowledge, abort the game
-        Delete(lg.GameID)
-    }
+	if ackCount == 2 {
+		// Both acknowledged, start the game
+		newCmd := &LetsStartTheGameCmd{
+			GameID:    lg.GameID,
+			Player1:   lg.Player1.PlayerID,
+			Player2:   lg.Player2.PlayerID,
+			Timestamp: time.Now(),
+		}
+		d.CommandDispatcher(newCmd)
+
+	} else {
+		// Players didn't acknowledge, abort the game
+		Delete(lg.GameID)
+	}
 }
 
 func NewWorker(workerID string) *Worker {
 	return &Worker{
-		GameID:      "",
-		WorkerID:    workerID,
+		GameID:   "",
+		WorkerID: workerID,
 	}
 }
 
 func (w *Worker) WorkerRun(d *Dispatcher, l *Lobby) {
 	rs := d.persister.redis
 	ctx := context.Background()
-	
+
 	messageChan, err := w.SubscribeToStream(rs, ctx, l)
-    if err != nil {
-        fmt.Println("Error setting up subscription to stream:", err)
-        return
-    }
+	if err != nil {
+		fmt.Println("Error setting up subscription to stream:", err)
+		return
+	}
 
 	for message := range messageChan {
-	// Acknowledge the processed message
-        _, ackErr := rs.client.XAck(ctx, streamName, l.consumerGroupKey, message.ID).Result()
-        if ackErr != nil {
-			d.errorLogger.InfoLog(ctx, "Error acknowledging message first time: %v", ackErr)
-
-			for k<6; k++ {
-				time.Sleep(100 * time.Millisecond)
-				_, err := rs.client.XAck(ctx, streamName, l.consumerGroupKey, message.ID).Result()
-				if err==nil {
-					ackErr = nil
-					break 
-				}
-			}
+		// Acknowledge the processed message
+		_, ackErr := rs.Client.XAck(ctx, streamName, l.consumerGroupKey, message.ID).Result()
 		if ackErr != nil {
-			d.errorLogger.ErrorLog(ctx, "Error acknowledging message repeatedly: %v", ackErr)
+			d.errorLogger.InfoLog(ctx, "Error acknowledging message first time: %v", zap.Error(ackErr))
+			k := 1
+			for k < 6 {
+				time.Sleep(100 * time.Millisecond)
+				_, err := rs.Client.XAck(ctx, streamName, l.consumerGroupKey, message.ID).Result()
+				if err == nil {
+					ackErr = nil
+					break
+				}
+				k++
+			}
+			if ackErr != nil {
+				d.errorLogger.InfoLog(ctx, "Error acknowledging message 6 times: %v", zap.Error(ackErr))
+			}
+
+			//interprept messsage
+
+			for {
+				playerChan := make(chan PlayerIdentity, 2)
+
+				player1 := <-playerChan
+				player2 := <-playerChan
+
+				// Generate a unique game ID
+				gameID, err := GenerateUniqueGameID(d.persister.postgres, w)
+				if err != nil {
+					// Handle the error here
+					continue
+				}
+				w.GameID = gameID
+
+				// Lock the game
+				lg := LockedGame{
+					GameID:   gameID,
+					WorkerID: w.WorkerID,
+					Player1:  player1,
+					Player2:  player2,
+				}
+				close(playerChan)
+				LockTheGame(d, lg) // Start or delete the game based on acknowledgment
+
+				// Wait for game to end signal
+
+			}
 		}
-
-		//interprept messsage
-		
-
-    for {
-		playerChan := make(chan PlayerIdentity, 2)
-		
-		player1 := <-playerChan
-        player2 := <-playerChan
-
-        // Generate a unique game ID
-        gameID, err := GenerateUniqueGameID(d.persister.postgres, w)
-        if err != nil {
-            // Handle the error here
-            continue
-        }
-        w.GameID = gameID
-
-        // Lock the game
-        lg := LockedGame{
-            GameID:   gameID,
-            WorkerID: w.WorkerID,
-            Player1:  player1, 
-            Player2:  player2,
-        }
-		close(playerChan)
-        LockTheGame(d, lg) // Start or delete the game based on acknowledgment
-
-		// Wait for game to end signal
-
-    }
-}
+	}
 }
 
 func checkForPlayerAck(cmd *LetsStartTheGameCmd, lg *LockedGame) bool {
-    var wg sync.WaitGroup
-    ackCh := make(chan bool, 2)
-    ackCount := 0
+	var wg sync.WaitGroup
+	ackCh := make(chan bool, 2)
+	ackCount := 0
 
-    checkAndAck := func(playerID string) {
-        defer wg.Done()
-        if isGameAcknowledged(cmd.GameID, playerID) {
-            ackCh <- true
-        }
-    }
+	checkAndAck := func(playerID string) {
+		defer wg.Done()
+		if isGameAcknowledged(cmd.GameID, playerID) {
+			ackCh <- true
+		}
+	}
 
-    wg.Add(2)
-    go checkAndAck(lg.Player1.PlayerID)
-    go checkAndAck(lg.Player2.PlayerID)
+	wg.Add(2)
+	go checkAndAck(lg.Player1.PlayerID)
+	go checkAndAck(lg.Player2.PlayerID)
 
-    wg.Wait()
-    close(ackCh)
+	wg.Wait()
+	close(ackCh)
 
-    // Count the number of true acknowledgments received
-    for ack := range ackCh {
-        if ack {
-            ackCount++
-        }
-    }
+	// Count the number of true acknowledgments received
+	for ack := range ackCh {
+		if ack {
+			ackCount++
+		}
+	}
 
-    // Check if both players acknowledged
-    if ackCount == 2 {
-        return true
-    }
+	// Check if both players acknowledged
+	if ackCount == 2 {
+		return true
+	}
 
-    Delete(cmd.GameID)
-    return false
+	Delete(cmd.GameID)
+	return false
 }
 
 var numLobbies int
 
-func (d *Dispatcher)StartNewWorkerPool(ctx context.Context, ctxCancelF context.CancelFunc, numWorkers int) {
+func (d *Dispatcher) StartNewWorkerPool(ctx context.Context, ctxCancelF context.CancelFunc, numWorkers int) {
 
 	rs := d.persister.redis
 	// Create a Lobby
 	lobby := NewLobby(numWorkers, numLobbies)
-	
+
 	// Create a ConsumerGroup for the Lobby
 	rs.createLobbyConsumerGroup(ctx, lobby)
 
 	// Start the Lobby
 	go lobby.Run()
-
+	
 	// Create and register workers
 	allWorkers := make([]*Worker, numWorkers)
 	for i := 0; i < numWorkers; i++ {
@@ -247,7 +248,7 @@ func (d *Dispatcher)StartNewWorkerPool(ctx context.Context, ctxCancelF context.C
 		go allWorkers[i].WorkerRun(d, lobby) // start the worker's processing loop
 		lobby.AddWorker(allWorkers[i])
 	}
-	
+
 	go lobby.waitForNewPlayer()
 
 	// Add players as they join
@@ -256,7 +257,7 @@ func (d *Dispatcher)StartNewWorkerPool(ctx context.Context, ctxCancelF context.C
 		lobby.AddPlayer(player)
 
 		time.Sleep(time.Millisecond * 100)
-		
+
 	}
 }
 
@@ -273,97 +274,95 @@ func getNewPlayer() PlayerIdentity {
 
 	// waiting for a connection from a client,
 	return PlayerIdentity{
-		PlayerID:       "00000001", // an internally assigned integer to avoid unnecessary propogation of their username 
-		Username: 		"kushlord123", // this will be moved....
-		CurrentPlayerRank:   10, // example
+		PlayerID:          "00000001",    // an internally assigned integer to avoid unnecessary propogation of their username
+		Username:          "kushlord123", // this will be moved....
+		CurrentPlayerRank: 10,            // example
 	}
 }
-
-
 
 // STREAM
 var streamName = "worker_pool_stream"
 
 func (rs *RedisGameState) makeStreamIfNoneExists(ctx context.Context) error {
-    // Use TYPE command to check the type of the key "WorkerPoolStream"
-    keyType, err := rs.client.Type(ctx, "WorkerPoolStream").Result()
-    if err != nil {
-        return fmt.Errorf("error checking stream type: %v", err)
-    }
+	// Use TYPE command to check the type of the key "WorkerPoolStream"
+	keyType, err := rs.Client.Type(ctx, "WorkerPoolStream").Result()
+	if err != nil {
+		return fmt.Errorf("error checking stream type: %v", err)
+	}
 
-    // If the type is "none", the stream does not exist, so create it
-    if keyType == "none" {
-        _, err = rs.client.XAdd(ctx, &redis.XAddArgs{
-            Stream: "WorkerPoolStream",
-            Values: map[string]interface{}{"dummy": "init"},
-        }).Result()
-        if err != nil {
-            return fmt.Errorf("error creating stream: %v", err)
-        }
-    } else if keyType != "stream" {
-        return fmt.Errorf("a key named 'WorkerPoolStream' exists but is not a stream")
-    }
+	// If the type is "none", the stream does not exist, so we must create it
+	if keyType == "none" {
+		_, err = rs.Client.XAdd(ctx, &redis.XAddArgs{
+			Stream: "WorkerPoolStream",
+			Values: map[string]interface{}{"dummy": "init"},
+		}).Result()
+		if err != nil {
+			return fmt.Errorf("error creating stream: %v", err)
+		}
+	} else if keyType != "stream" {
+		return fmt.Errorf("a key named 'WorkerPoolStream' exists but is not a stream")
+	}
 
-    return nil
+	return nil
 }
 func (rs *RedisGameState) createLobbyConsumerGroup(ctx context.Context, l *Lobby) error {
-	
-	// new lobby means we need to increase the counter by 1 for the lobby ID
-	numLobbies++	
-	
-	// Create a consumer group (assuming the stream already exists)
-	l.consumerGroupKey = "lobby"+strconv.Itoa(l.IDnum)
-	err := rs.client.XGroupCreate(ctx,  "gameWorkersGroup",l.consumerGroupKey, "$").Err()
-	if err == nil {
-        return nil
-    }
-	   // If we're here, we encountered an error. Check if it's because the consumer group already exists.
-	if !strings.Contains(err.Error(), "already exists") {
-        return fmt.Errorf("error creating consumer group for lobby!: %v", err)
-    }
-    
-	// Handle collision by incrementing lobby ID
-    numLobbies++  // this is a global var for now...
-    l.IDnum = numLobbies
-    l.consumerGroupKey = "lobby" + strconv.Itoa(l.IDnum)
-    
-    // Try creating the consumer group again
-    err = rs.client.XGroupCreate(ctx, "gameWorkersGroup", l.consumerGroupKey, "$").Err()
-    if err == nil {
-        return fmt.Errorf("WARN: Lobby ID had to be changed because one already existed. Old ID was %v", l.IDnum-1)
-    } 
 
-    return fmt.Errorf("error creating consumer group for lobby after retry!: %v", err)
+	// new lobby means we need to increase the counter by 1 for the lobby ID
+	numLobbies++
+
+	// Create a consumer group (assuming the stream already exists)
+	l.consumerGroupKey = "lobby" + strconv.Itoa(l.IDnum)
+	err := rs.Client.XGroupCreate(ctx, "gameWorkersGroup", l.consumerGroupKey, "$").Err()
+	if err == nil {
+		return nil
+	}
+	// If we're here, we encountered an error. Check if it's because the consumer group already exists.
+	if !strings.Contains(err.Error(), "already exists") {
+		return fmt.Errorf("error creating consumer group for lobby!: %v", err)
+	}
+
+	// Handle collision by incrementing lobby ID
+	numLobbies++ // this is a global var for now...
+	l.IDnum = numLobbies
+	l.consumerGroupKey = "lobby" + strconv.Itoa(l.IDnum)
+
+	// Try creating the consumer group again
+	err = rs.Client.XGroupCreate(ctx, "gameWorkersGroup", l.consumerGroupKey, "$").Err()
+	if err == nil {
+		return fmt.Errorf("WARN: Lobby ID had to be changed because one already existed. Old ID was %v", l.IDnum-1)
+	}
+
+	return fmt.Errorf("error creating consumer group for lobby after retry!: %v", err)
 }
 
 func (w *Worker) SubscribeToStream(rs *RedisGameState, ctx context.Context, l *Lobby) (<-chan redis.XMessage, error) {
-    out := make(chan redis.XMessage)
+	out := make(chan redis.XMessage)
 
-    go func() {
-        defer close(out)
+	go func() {
+		defer close(out)
 
-        for {
-            messages, err := rs.client.XReadGroup(ctx, &redis.XReadGroupArgs{
-                Group:    l.consumerGroupKey,
-                Consumer: w.WorkerID,
-                Streams:  []string{"gameEvents", ">"},
-                Block:    5 * time.Second,  // Block for 5 seconds if no messages
-                Count:    10,
-            }).Result()
+		for {
+			messages, err := rs.Client.XReadGroup(ctx, &redis.XReadGroupArgs{
+				Group:    l.consumerGroupKey,
+				Consumer: w.WorkerID,
+				Streams:  []string{"gameEvents", ">"},
+				Block:    5 * time.Second, // Block for 5 seconds if no messages
+				Count:    10,
+			}).Result()
 
-            if err != nil {
-                fmt.Println("Error reading from stream:", err)
-                // Decide how to handle this error. Perhaps add a backoff or sleep before retrying.
-                continue
-            }
+			if err != nil {
+				fmt.Println("Error reading from stream:", err)
+				// Decide how to handle this error. Perhaps add a backoff or sleep before retrying.
+				continue
+			}
 
-            for _, xMessage := range messages {
-                for _, message := range xMessage.Messages {
-                    out <- message
-                }
-            }
-        }
-    }()
+			for _, xMessage := range messages {
+				for _, message := range xMessage.Messages {
+					out <- message
+				}
+			}
+		}
+	}()
 
-    return out, nil
+	return out, nil
 }

@@ -16,12 +16,12 @@ type Lobby struct {
 }
 
 var (
-	playersPerWorkerAllowedInLobby = 20
+	nMaxPlayersPerWorkersPerLobby = 20
 )
 
 // NewLobby creates a new Lobby instance
 func NewLobby(numWorkers, id int) *Lobby {
-	nAllowedPlayers := playersPerWorkerAllowedInLobby*numWorkers
+	nAllowedPlayers := nMaxPlayersPerWorkersPerLobby*numWorkers
 	return &Lobby{
 		PlayerQueue: make(chan PlayerIdentity, nAllowedPlayers),
 		workerQueue: make(chan *Worker, numWorkers),

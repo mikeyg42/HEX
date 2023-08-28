@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+// I've duplicated this in the  Models package to reduce size.
+// ...,if you change this , be sure to change there too!!
 type TimerControl struct {
 	startChan chan struct{}
 	stopChan  chan struct{}

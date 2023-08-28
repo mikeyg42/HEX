@@ -1,4 +1,4 @@
-package main
+package storage
 
 import (
 	"context"
@@ -11,16 +11,9 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
+	_ "gorm.io/driver/postgres"
+	_ "github.com/mikeyg42/HEX/models"
 )
-
-type ContextFn func(ctx context.Context) []zapcore.Field
-
-type Logger struct {
-	ZapLogger     *zap.Logger
-	LogLevel      gormlogger.LogLevel
-	SlowThreshold time.Duration
-	Context       ContextFn
-}
 
 func initLogger(logFilePath string, level gormlogger.LogLevel) Logger {
 	encoderConfig := zap.NewProductionEncoderConfig()

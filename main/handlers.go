@@ -7,200 +7,59 @@ gorm "gorm.io/gorm"
  "context"
  "strconv"
  "strings"
- "errors"
+
  cache "github.com/go-redis/cache/v9"
  redis "github.com/redis/go-redis/v9"
  zap "go.uber.org/zap"
 
 )
 
-//................ commands ......................//
-type Event interface {
-	// ModifyPersistedDataTable will be used by events to persist data to the database.
-	ModifyPersistedDataTable(ctx context.Context) error
-	MarshalEvt() ([]byte, error)
-}
-
-type Command interface {
-	MarshalCmd() ([]byte, error)
-}
-
-var cmdTypeMap = map[string]interface{}{
-	"DeclaringMoveCmd":    &DeclaringMoveCmd{},
-	"LetsStartTheGameCmd": &LetsStartTheGameCmd{},
-	"PlayerForfeitingCmd": &PlayerForfeitingCmd{},
-	"NextTurnStartingCmd": &NextTurnStartingCmd{},
-	"EndingGameCmd":       &EndingGameCmd{},
-}
-
-type EndingGameCmd struct {
-	Command
-	GameID       string `json:"gameId"`
-	WinnerID     string `json:"winnerId"`
-	LoserID      string `json:"loserId"`
-	WinCondition string `json:"moveData"`
-}
-
-type NextTurnStartingCmd struct {
-	Command
-	GameID             string
-	PriorPlayerID      string
-	NextPlayerID       string
-	UpcomingMoveNumber int
-	TimeStamp          time.Time
-}
-
-type DeclaringMoveCmd struct {
-	Command
-	ID             string    `json:"id"`
-	GameID         string    `json:"gameId"`
-	SourcePlayerID string    `json:"playerId"`
-	DeclaredMove   string    `json:"moveData"`
-	Timestamp      time.Time `json:"timestamp"`
-}
-
-type CheckForWinConditionCmd struct {
-	Command
-	GameID    string    `json:"gameId"`
-	MoveCount int       `json:"moveCount"`
-	PlayerID  string    `json:"playerId"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
-type LetsStartTheGameCmd struct {
-	Command
-	GameID         string    `json:"gameId"`
-	NextMoveNumber int       `json:"nextMoveNumber"`
-	Player1        string    `json:"player1"`
-	Player2        string    `json:"player2"`
-	Timestamp      time.Time `json:"timestamp"`
-}
-
-type PlayerForfeitingCmd struct {
-	Command
-	ID             string    `json:"id"`
-	GameID         string    `json:"gameId"`
-	SourcePlayerID string    `json:"playerId"`
-	Timestamp      time.Time `json:"timestamp"`
-	Reason         string    `json:"reason"`
-}
-
-
-// ................ events ......................//
-var eventTypeMap = map[string]interface{}{
-	"GameAnnouncementEvent":        &GameAnnouncementEvent{},
-	"DeclaredMoveEvent":            &DeclaredMoveEvent{},
-	"InvalidMoveEvent":             &InvalidMoveEvent{},
-	"OfficialMoveEvent":            &OfficialMoveEvent{},
-	"GameStateUpdate":              &GameStateUpdate{},
-	"GameStartEvent":               &GameStartEvent{},
-	"TimerON_StartTurnAnnounceEvt": &TimerON_StartTurnAnnounceEvt{},
-}
-
-type GameAnnouncementEvent struct {
-	Event
-	GameID         string    `json:"gameId"`
-	FirstPlayerID  string    `json:"firstplayerID"`
-	SecondPlayerID string    `json:"secondplayerID"`
-	Timestamp      time.Time `json:"timestamp"`
-}
-
-type DeclaredMoveEvent struct {
-	Event
-	GameID    string    `json:"gameId"`
-	PlayerID  string    `json:"playerId"`
-	MoveData  string    `json:"moveData"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
-type InvalidMoveEvent struct {
-	Event
-	GameID      string `json:"gameId"`
-	PlayerID    string `json:"playerId"`
-	InvalidMove string `json:"moveData"`
-}
-
-type GameStartEvent struct {
-	Event
-	GameID         string
-	FirstPlayerID  string
-	SecondPlayerID string
-	Timestamp      time.Time
-}
-
-type TimerON_StartTurnAnnounceEvt struct {
-	Event
-	GameID         string
-	ActivePlayerID string
-	TurnStartTime  time.Time
-	TurnEndTime    time.Time
-	MoveNumber     int
-}
-
-type OfficialMoveEvent struct {
-	Event
-	GameID    string    `json:"gameId"`
-	PlayerID  string    `json:"playerId"`
-	MoveData  string    `json:"moveData"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
-type GameStateUpdate struct {
-	gorm.Model  `redis:"-"`
-	Event       `redis:"-"`
-	GameID      string
-	MoveCounter int
-	PlayerID    string
-	xCoordinate string
-	yCoordinate int
-
-	ConcatenatedMove string `redis:"-"`
-}
-
 //................. HANDLERS .....................//
 
 // Event Handler Wrapper
 func (d *Dispatcher) handleEventWrapper(event interface{}) {
-	d.eventChan <- event
+	d.EventChan <- event
 }
 
 // Command Handler Wrapper
 func (d *Dispatcher) handleCommandWrapper(cmd interface{}) {
-	d.commandChan <- cmd
+	d.CommandChan <- cmd
 }
 
 // Event Handler
 func (d *Dispatcher) handleEvent(done <-chan struct{}, event Event, eventPubSub *redis.PubSub) error {
+	con := d.Container
+	
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	switch event := event.(type) {
 	case *InvalidMoveEvent:
-		d.errorLogger.Warn(ctx, "Received InvalidMoveEvent: %v", event)
+		con.ErrorLog.Warn(ctx, "Received InvalidMoveEvent: %v", event)
 
 
 	case *OfficialMoveEvent:
 		strs := []string{event.GameID, event.PlayerID, "has made a move:", event.MoveData}
-		d.eventCmdLogger.Info(ctx, strings.Join(strs, "/"))
+		con.EventCmdLog.Info(ctx, strings.Join(strs, "/"))
 
 		// To get here means the player's move was valid! Therefore, we can stop their countdown. we will start new one after processing this move
-		d.timer.StopTimer()
+		con.Timer.StopTimer()
 
 		// This will parse the new move and then publish another message to the event bus that will be picked up by persisting logic and the win condition logic
-		newEvt := d.Handler_OfficialMoveEvt(ctx, event)
+		newEvt := con.Handler_OfficialMoveEvt(ctx, event)
 		d.EventDispatcher(newEvt)
 
 	case *GameStateUpdate:
 		// Persist the data and check win conditions
-		newCmd := d.persister.HandleGameStateUpdate(event)
+		newCmd := con.Persister.HandleGameStateUpdate(event)
 
 		d.CommandDispatcher(newCmd)
 
-		d.timer.StopTimer() //always do this before starting timer again to ensure that the timer is flushed. It doesnt hurt to stop repeatedly.
+		con.Timer.StopTimer() //always do this before starting timer again to ensure that the timer is flushed. It doesnt hurt to stop repeatedly.
 
 	default:
-		d.errorLogger.Error(ctx, "unknown event type: %v", fmt.Errorf("weird event type: %v", event))
-		d.eventCmdLogger.Info(ctx, "Received Unusual, unknown event: %v", event)
+		con.ErrorLog.Error(ctx, "unknown event type: %v", fmt.Errorf("weird event type: %v", event))
+		con.EventCmdLog.Info(ctx, "Received Unusual, unknown event: %v", event)
 	}
 	return nil
 }
@@ -208,6 +67,8 @@ func (d *Dispatcher) handleEvent(done <-chan struct{}, event Event, eventPubSub 
 func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPubSub *redis.PubSub) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	con := d.Container
 
 	switch cmd := cmd.(type) {
 	case *DeclaringMoveCmd:
@@ -223,7 +84,7 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 				MoveData:  cmd.DeclaredMove,
 				Timestamp: time.Now(),
 			}
-			d.timer.StopTimer() 
+			con.Timer.StopTimer() 
 			d.EventDispatcher(newEvent)
 			return
 
@@ -240,19 +101,14 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 		cacheKey := fmt.Sprintf("cache:%d:movelist", cmd.GameID)
 		moveList := make(map[int]string)
 		
-		cacheErr := d.persister.cache.Once(&cache.Item{
+		cacheErr := con.Persister.cache.Once(&cache.Item{
+			Ctx:   ctx,
 			Key:   cacheKey,
 			Value: &moveList, // The destination where moves will be loaded into
+			TTL:   time.Minute * 30,
 			Do: func(*cache.Item) (interface{}, error) {
-				// If not in cache, fetch it from Redis
-				ctxTime, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-				defer cancel() // Always defer a cancel for cleanup
-
-				fetchedMoves, ok := d.fetchMoveList(ctxTime, cmd.GameID, &lockedGame)
-				if !ok || errors.Is(ctxTime.Err(), context.DeadlineExceeded) {
-					// fetchFromPostgres
-				}
-				return fetchedMoves, nil  // return the map you fetched, which will populate moveList
+				// Fetches from 3-tiered persistence
+				return con.retrieveMoveList(ctx, cmd.GameID, &lockedGame)
 			},
 		})
 
@@ -264,7 +120,7 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 		// now, from our command, we can look into the moveList and see if the move is valid
 		new_key, err := strconv.Atoi(moveParts[0]) // new_key is the move counter. 
 		if err != nil {
-			d.errorLogger.ErrorLog(ctx, "Error converting moveCounter to int", zap.Error(err))
+			con.ErrorLog.ErrorLog(ctx, "Error converting moveCounter to int", zap.Error(err))
 		}
 		new_val := moveParts[2] // new_val is the concatenated x and y coordinates of the most recent move
 		
@@ -279,7 +135,7 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 
 			if value == new_val {
 				// Value already exists in the moveList.
-				d.errorLogger.ErrorLog(ctx, "Invalid, duplicate move detected", zap.String("Move", new_val), zap.String("GameID", cmd.GameID), zap.String("PlayerID", cmd.SourcePlayerID))
+				con.ErrorLog.ErrorLog(ctx, "Invalid, duplicate move detected", zap.String("Move", new_val), zap.String("GameID", cmd.GameID), zap.String("PlayerID", cmd.SourcePlayerID))
 				
 				newEvent := &InvalidMoveEvent{
 					GameID:      cmd.GameID,
@@ -294,7 +150,7 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 
 		if maxKey == -1 {
 			// Log or handle the situation where no key was found.
-			d.errorLogger.ErrorLog(ctx, "No key found in move list")
+			con.ErrorLog.ErrorLog(ctx, "No key found in move list")
 		}
 		if maxKey+1 != new_key {
 			// that means we missed a value. so we should go straight to postgres and try to fetch again. if it happens again, we panic
@@ -311,10 +167,10 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 
 	case *NextTurnStartingCmd:
 
-		d.eventCmdLogger.Info(ctx, fmt.Sprintf("NextTurnStartingCmd received for game : %s",cmd.GameID))
+		con.EventCmdLog.Info(ctx, fmt.Sprintf("NextTurnStartingCmd received for game : %s",cmd.GameID))
 
 		// Only Place you start the timer!
-		d.timer.StartTimer()
+		con.Timer.StartTimer()
 
 		startTime := time.Now()
 		endTime := startTime.Add(moveTimeout)
@@ -330,9 +186,9 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 
 	case *PlayerForfeitingCmd:
 
-		d.eventCmdLogger.Info(ctx, "Player forfeited the game", zap.String("PlayerID", cmd.SourcePlayerID), zap.String("GameID", cmd.GameID), zap.String("ForfeitReason", cmd.Reason))
+		con.EventCmdLog.Info(ctx, "Player forfeited the game", zap.String("PlayerID", cmd.SourcePlayerID), zap.String("GameID", cmd.GameID), zap.String("ForfeitReason", cmd.Reason))
 
-		d.timer.StopTimer()
+		con.Timer.StopTimer()
 
 		// Determine who the winner is via the allLockedGames struct
 		lg := allLockedGames[cmd.GameID]
@@ -356,7 +212,7 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 				WinCondition: winCondition,
 			}
 		} else {
-			d.errorLogger.ErrorLog(ctx, "Error parsing the winner from AllLockedGames global", zap.String("LoserID", cmd.SourcePlayerID), zap.String("GameID", cmd.GameID), zap.String("ForfeitReason", cmd.Reason))
+			con.ErrorLog.ErrorLog(ctx, "Error parsing the winner from AllLockedGames global", zap.String("LoserID", cmd.SourcePlayerID), zap.String("GameID", cmd.GameID), zap.String("ForfeitReason", cmd.Reason))
 		}
 		d.EventDispatcher(newCmd)
 
@@ -387,15 +243,15 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 		d.EventDispatcher(startEvent)
 
 		// MAKE THE TIMER AND START IT INITIALLY
-		d.timer = MakeNewTimer()
-		d.timer.startChan <- struct{}{}
+		con.Timer = MakeNewTimer()
+		con.Timer.startChan <- struct{}{}
 
 	}
 }
 
-func (d *Dispatcher) fetchMoveList(ctx context.Context, GameID string, lockedGame *LockedGame) (map[int]string, bool) {
+func (con *GameContainer) fetchMoveList(ctx context.Context, GameID string, lockedGame *LockedGame) (map[int]string, bool) {
 
-	pipe := d.persister.redis.Client.Pipeline()
+	pipe := con.Persister.redis.Client.Pipeline()
 
 	// Prepare commands for moves1 and moves2
 	getMoves1 := pipe.HGetAll(ctx, fmt.Sprintf("MoveList:%s:%s", GameID, lockedGame.Player1.PlayerID))
@@ -404,7 +260,7 @@ func (d *Dispatcher) fetchMoveList(ctx context.Context, GameID string, lockedGam
 	// Execute pipelined commands
 	_, err := pipe.Exec(ctx)
 	if err != nil {
-		d.errorLogger.InfoLog(ctx, "error fetching moves from redis", zap.String("redis error", "executing pipeline"), zap.Error(err))
+		con.ErrorLog.InfoLog(ctx, "error fetching moves from redis", zap.String("redis error", "executing pipeline"), zap.Error(err))
 
 		return nil, false
 	}
@@ -413,7 +269,7 @@ func (d *Dispatcher) fetchMoveList(ctx context.Context, GameID string, lockedGam
 	moves1, err1 := getMoves1.Result()
 	moves2, err2 := getMoves2.Result()
 	if err1 != nil || err2 != nil {
-		d.errorLogger.InfoLog(ctx, "error fetching moves from redis", zap.String("redis error", "fetching results after pipeline"), zap.Error(err1), zap.Error(err2))
+		con.ErrorLog.InfoLog(ctx, "error fetching moves from redis", zap.String("redis error", "fetching results after pipeline"), zap.Error(err1), zap.Error(err2))
 		return nil, false
 	}
 
@@ -431,7 +287,7 @@ func (d *Dispatcher) fetchMoveList(ctx context.Context, GameID string, lockedGam
 
 	// this below effectively replaced the two skipped errors within the above loops
 	if len(allMoves)== 0 || len(allMoves) != len(moves1)+len(moves2) {
-		d.errorLogger.InfoLog(ctx, "error fetching moves from redis: %v", zap.String("redis error", "combining maps"))
+		con.ErrorLog.InfoLog(ctx, "error fetching moves from redis: %v", zap.String("redis error", "combining maps"))
 		return nil, false
 	}
 
@@ -439,9 +295,9 @@ func (d *Dispatcher) fetchMoveList(ctx context.Context, GameID string, lockedGam
 }
 
 
-func (d *Dispatcher) parseOfficialMoveEvt(ctx context.Context, e *OfficialMoveEvent) (*GameStateUpdate, error) {
+func (con *GameContainer) parseOfficialMoveEvt(ctx context.Context, e *OfficialMoveEvent) (*GameStateUpdate, error) {
 	// parses the OfficialMoveEvent and returns a GameStateUpdate struct, the next event in the progresssion, this struct is saveable in DB
-	logger := d.errorLogger
+	logger := con.ErrorLog
 	moveParts := strings.Split(e.MoveData, ".")
 
 	if len(moveParts) != 3 {
@@ -482,11 +338,11 @@ func (d *Dispatcher) parseOfficialMoveEvt(ctx context.Context, e *OfficialMoveEv
 	return update, nil
 }
 
-func (d *Dispatcher) Handler_OfficialMoveEvt(ctx context.Context, evt *OfficialMoveEvent) *GameStateUpdate {
+func (con *GameContainer) Handler_OfficialMoveEvt(ctx context.Context, evt *OfficialMoveEvent) *GameStateUpdate {
 
-	newEvt, err := d.parseOfficialMoveEvt(ctx, evt)
+	newEvt, err := con.parseOfficialMoveEvt(ctx, evt)
 	if err != nil {
-		d.errorLogger.ErrorLog(ctx, "error extracting move data", zap.Error(err))
+		con.ErrorLog.ErrorLog(ctx, "error extracting move data", zap.Error(err))
 	}
 	return newEvt
 }

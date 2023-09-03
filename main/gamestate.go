@@ -4,43 +4,20 @@ import (
 	"context"
 	"fmt"
 	"time"
+    _ "github.com/mikeyg42/HEX/models"
 
 	zap "go.uber.org/zap"
 	"gorm.io/gorm"
 )
-
-type Vertex struct {
-	X int `json:"x" gorm:"type:integer"`
-	Y int `json:"y" gorm:"type:integer"`
-}
-
-type GameState struct {
-	gorm.Model
-	GameID          string   `gorm:"type:varchar(100);uniqueIndex"`
-	Player1Moves    []Vertex `gorm:"type:jsonb"`
-	AdjacencyGraph1 [][]int  `json:"adjacencyGraph1" gorm:"type:jsonb"`
-	Player2Moves    []Vertex `gorm:"type:jsonb"`
-	AdjacencyGraph2 [][]int  `json:"adjacencyGraph2" gorm:"type:jsonb"`
-}
-
-type MoveLog struct {
-	ID          uint   `gorm:"primaryKey"`
-	GameID      string `gorm:"type:varchar(100);index"`
-	MoveCounter int
-	PlayerID    string `gorm:"type:varchar(100)"`
-	xCoordinate string `gorm:"type:varchar(2)"`
-	yCoordinate int
-	Timestamp   int64 `gorm:"autoCreateTime:milli"`
-}
 
 const SideLenGameboard = 15
 const maxRetries = 3
 
 // ..... HANDLERS ............//
 
-func (gsp *GameStatePersister) HandleGameStateUpdate(newMove *GameStateUpdate) interface{} {
-	pg := gsp.postgres
-	rs := gsp.redis
+func (con *GameContainer) HandleGameStateUpdate(newMove *GameStateUpdate) interface{} {
+	pg := con.Persister.postgres
+	rs := con.Persister.redis
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
 
@@ -61,24 +38,27 @@ func (gsp *GameStatePersister) HandleGameStateUpdate(newMove *GameStateUpdate) i
 	if err != nil {
 		//handle
 	}
+
 	// retrieve adjacency matrix and movelist from redis, with postgres as fall back option
-	oldAdjG, oldMoveList := gsp.FetchGameState(ctx, newVert, gameID, playerID, moveCounter)
+	oldAdjG, oldMoveList := con.Persister.FetchGameState(ctx, newVert, gameID, playerID, moveCounter)
 	newAdjG, newMoveList := IncorporateNewVert(ctx, oldMoveList, oldAdjG, newVert)
 
 	// DONE UPDATING GAMESTATE! NOW WE USE IT
 	win_yn := evalWinCondition(newAdjG, newMoveList)
+	
 	// ... AND SAVE IT
 	err = pg.PersistGameState_sql(ctx, newMove)
+	
 	if err != nil {
 		// Handle the error
 	}
 	// adjacency matrix
 	if err := rs.PersistGraphToRedis(ctx, newAdjG, gameID, playerID); err != nil {
-		RetryFunc(func() error { return rs.PersistGraphToRedis(ctx, newAdjG, gameID, playerID) })
+		con.RetryFunc(ctx,func() error { return rs.PersistGraphToRedis(ctx, newAdjG, gameID, playerID) })
 	}
 	// move List
 	if err := rs.PersistMoveToRedisList(ctx, newVert, gameID, playerID); err != nil {
-		RetryFunc(func() error { return rs.PersistMoveToRedisList(ctx, newVert, gameID, playerID) })
+		con.RetryFunc(ctx,func() error { return rs.PersistMoveToRedisList(ctx, newVert, gameID, playerID) })
 	}
 
 	// cancel the context for this event handling
@@ -92,7 +72,7 @@ func (gsp *GameStatePersister) HandleGameStateUpdate(newMove *GameStateUpdate) i
 			loserID = lg.Player2.PlayerID
 		}
 
-		newCmd := &EndingGameCmd{
+		newCmd := &hex.EndingGameCmd{
 			GameID:       gameID,
 			WinnerID:     playerID,
 			LoserID:      loserID,
@@ -106,7 +86,7 @@ func (gsp *GameStatePersister) HandleGameStateUpdate(newMove *GameStateUpdate) i
 			nextPlayer = "P1"
 		}
 
-		newCmd := &NextTurnStartingCmd{
+		newCmd := &hex.NextTurnStartingCmd{
 			GameID:             gameID,
 			PriorPlayerID:      playerID,
 			NextPlayerID:       nextPlayer,
@@ -119,19 +99,49 @@ func (gsp *GameStatePersister) HandleGameStateUpdate(newMove *GameStateUpdate) i
 	// include a check to compare redis and postgres?
 }
 
-func RetryFunc(function func() error) error {
-	var lastErr error
-	for i := 0; i < maxRetries; i++ {
-		if lastErr = function(); lastErr == nil {
-			return nil
-		}
-		// Log the error
-		fmt.Printf("Attempt %d failed with error: %v. Retrying...\n", i+1, lastErr)
+type RResult struct {
+	Err     error
+	Message string
+}
 
+type FuncWithErrorOnly func() error
+type FuncWithResult func() *RResult
+
+func (con *GameContainer) RetryFunc(ctx context.Context, function interface{}) *RResult {
+	var lastErr error
+	var msg string
+
+	for i := 0; i < maxRetries; i++ {
+		switch f := function.(type) {
+		case FuncWithErrorOnly:
+			lastErr = f()
+		case FuncWithResult:
+			result := f()
+			lastErr = result.Err
+			msg = result.Message
+		default:
+			return &RResult{Err: fmt.Errorf("unsupported function type")}
+		}
+
+		if lastErr == nil {
+			con.ErrorLog.InfoLog(ctx, "RetryFunc SUCCESS", zap.Int("RetryFunc iteration num", i))
+			return &RResult{
+				Err:     nil,
+				Message: msg,
+			}
+		}
+
+		con.ErrorLog.InfoLog(ctx, fmt.Sprintf("Attempt %d failed with error: %v. Retrying...\n", i+1, lastErr), zap.Int("RetryFunc iteration num", i))
 		// Introduce a delay with exponential backoff
 		time.Sleep(time.Second * time.Duration(1<<i))
 	}
-	return fmt.Errorf("failed after %d attempts. Last error: %v", maxRetries, lastErr)
+
+	err := fmt.Errorf("failed after %d attempts. Last error: %v", maxRetries, lastErr)
+
+	return &RResult{
+		Err:     err,
+		Message: msg,
+	}
 }
 
 func (pg *PostgresGameState) RecreateGS_Postgres(ctx context.Context, playerID, gameID string, moveCounter int) ([][]int, []Vertex, error) {

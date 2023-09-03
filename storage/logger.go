@@ -1,28 +1,29 @@
-package main
+package storage
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/natefinch/lumberjack.v2"
+	_ "gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 )
-
-type ContextFn func(ctx context.Context) []zapcore.Field
 
 type Logger struct {
 	ZapLogger     *zap.Logger
 	LogLevel      gormlogger.LogLevel
 	SlowThreshold time.Duration
-	Context       ContextFn
+	ContextFn     ContextFunction
+	mu            sync.Mutex
 }
 
-func initLogger(logFilePath string, level gormlogger.LogLevel) Logger {
+func InitLogger(logFilePath string, level gormlogger.LogLevel) *Logger {
 	encoderConfig := zap.NewProductionEncoderConfig()
 	encoderConfig.TimeKey = "timestamp"
 	encoderConfig.EncodeTime = zapcore.TimeEncoderOfLayout("Jan 02 15:04:05.000000000")
@@ -46,48 +47,40 @@ func initLogger(logFilePath string, level gormlogger.LogLevel) Logger {
 	if core == nil {
 		panic("core is nil")
 	}
-	
+
 	logger := zap.New(core, zap.AddCaller(), zap.AddCallerSkip(1))
 
-	return Logger{
+	return &Logger{
 		ZapLogger:     logger,
 		LogLevel:      level,
 		SlowThreshold: 100 * time.Millisecond,
-		Context:       nil,
+		ContextFn:       nil,
+		mu:            sync.Mutex{},
 	}
 }
 
-func (l Logger) LogMode(level gormlogger.LogLevel) gormlogger.Interface {
-	return Logger{
-		ZapLogger:     l.ZapLogger,
-		SlowThreshold: l.SlowThreshold,
-		LogLevel:      level,
-		Context:       l.Context,
-	}
-}
-
-func (l Logger) Info(ctx context.Context, str string, args ...interface{}) {
+func (l *Logger) Info(ctx context.Context, str string, args ...interface{}) {
 	if l.LogLevel < gormlogger.Info {
 		return
 	}
 	l.logger(ctx).Info(fmt.Sprintf(str, args...))
 }
 
-func (l Logger) Warn(ctx context.Context, str string, args ...interface{}) {
+func (l *Logger) Warn(ctx context.Context, str string, args ...interface{}) {
 	if l.LogLevel < gormlogger.Warn {
 		return
 	}
 	l.logger(ctx).Warn(fmt.Sprintf(str, args...))
 }
 
-func (l Logger) Error(ctx context.Context, str string, args ...interface{}) {
+func (l *Logger) Error(ctx context.Context, str string, args ...interface{}) {
 	if l.LogLevel < gormlogger.Error {
 		return
 	}
 	l.logger(ctx).Error(fmt.Sprintf(str, args...))
 }
 
-func (l Logger) Trace(ctx context.Context, begin time.Time, fc func() (string, int64), err error) {
+func (l *Logger) Trace(ctx context.Context, begin time.Time, fc func() (string, int64), err error) {
 	if l.LogLevel <= 0 {
 		return
 	}
@@ -106,20 +99,24 @@ func (l Logger) Trace(ctx context.Context, begin time.Time, fc func() (string, i
 	}
 }
 
-func (l Logger) logger(ctx context.Context) *zap.Logger {
+func (l *Logger) logger(ctx context.Context) *zap.Logger {
 	logger := l.ZapLogger
-	if l.Context != nil {
-		fields := l.Context(ctx)
+	if l.ContextFn != nil {
+		fields := l.ContextFn(ctx)
 		logger = logger.With(fields...)
 	}
 	return logger
 }
 
 func (logger *Logger) ErrorLog(ctx context.Context, msg string, fields ...zapcore.Field) {
+	logger.mu.Lock()
+	defer logger.mu.Unlock()
 	logger.ZapLogger.Error(msg, fields...)
 }
 
 func (logger *Logger) InfoLog(ctx context.Context, msg string, fields ...zapcore.Field) {
+	logger.mu.Lock()
+	defer logger.mu.Unlock()
 	logger.ZapLogger.Info(msg, fields...)
 }
 

@@ -10,7 +10,8 @@ import (
 	zap "go.uber.org/zap"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
-	_ "github.com/mikeyg42/HEX/models"
+	hex "github.com/mikeyg42/HEX/models"
+	storage "github.com/mikeyg42/HEX/storage"
 )
 
 // ...................... game Lock ......................//
@@ -20,10 +21,6 @@ const (
 	shortDur = 1 * time.Second
 )
 
-var (
-	ListenAddr = "??"
-	RedisAddr  = "localhost:6379"
-)
 
 
 
@@ -64,16 +61,16 @@ func main() {
 //................................................//
 
 
-func (con *GameContainer) GracefullyExiting() {
+func (con *hex.GameContainer) GracefullyExiting() {
 
 	// Close the Redis client = 
-	err := con.Persister.redis.Client.Close()
+	err := con.Persister.Redis.Client.Close()
 	if err != nil {
 		con.ErrorLog.ErrorLog(context.TODO(), "Error closing Redis client:", zap.Bool("close redis client", false), zap.Error(err))
 	}
 
 	// Close the Postgres client
-	sqlDB, err := con.Persister.postgres.DB.DB()
+	sqlDB, err := con.Persister.Postgres.DB.DB()
 	if err != nil {
 		con.ErrorLog.ErrorLog(context.TODO(), "Error closing postgresql connection using generic sqlDB method", zap.Bool("close postgres connection", false), zap.Error(err))
 	}
@@ -84,25 +81,25 @@ func (con *GameContainer) GracefullyExiting() {
 	con.EventCmdLog.ZapLogger.Sync()
 	
 	// cancel the parent context, canceling all children too
-	con.Exiter.parentCancelFunc()
+	con.Exiter.ParentCancelFunc()
 
 }
 
 //................................................//
 
 
-func NewGameContainer(ctx context.Context, ctxCancelFunc context.CancelFunc) (*GameContainer, error) {
-	eventCmdLogger := initLogger("/Users/mikeglendinning/projects/HEX/eventCommandLog.log", gormlogger.Info)
-	errorLogger := initLogger("/Users/mikeglendinning/projects/HEX/errorLog.log", gormlogger.Info)
+func NewGameContainer(ctx context.Context, ctxCancelFunc context.CancelFunc) (*hex.GameContainer, error) {
+	eventCmdLogger := storage.InitLogger("/Users/mikeglendinning/projects/HEX/eventCommandLog.log", gormlogger.Info)
+	errorLogger := storage.InitLogger("/Users/mikeglendinning/projects/HEX/errorLog.log", gormlogger.Info)
 	
-	eventCmdCtx := context.WithValue(ctx, eventCmdLoggerKey{}, eventCmdLogger)
-	errorLogCtx := context.WithValue(ctx, errorLoggerKey{}, errorLogger)
+	eventCmdCtx := context.WithValue(ctx, hex.EventCmdLoggerKey{}, &eventCmdLogger)
+	errorLogCtx := context.WithValue(ctx, hex.ErrorLoggerKey{}, &errorLogger)
 
 	eventCmdLogger.ZapLogger.Sync()
 	errorLogger.ZapLogger.Sync()
 
     // Initialize the RedisGameState, PostgresGameState
-	gsp, RedisErr, PostgresErr := InitializePersistence(ctx)
+	gsp, RedisErr, PostgresErr := storage.InitializePersistence(ctx)
 	if gsp == nil {
 		if RedisErr != nil {
 			errorLogger.ErrorLog(ctx, "Error initializing persistence", zap.Bool("initialize persistence", false), zap.String("errorSource", "REDIS"))
@@ -110,19 +107,19 @@ func NewGameContainer(ctx context.Context, ctxCancelFunc context.CancelFunc) (*G
 		if PostgresErr != nil {
 			errorLogger.ErrorLog(ctx, "Error initializing persistence", zap.Bool("initialize persistence", false), zap.String("errorSource", "PostgresQL"))
 		}
-		return nil, fmt.Errorf("errors: logger: %v, redis: %v, postgres: %v", LogErr, RedisErr, PostgresErr)
+		return nil, fmt.Errorf("errors: redis: %v, postgres: %v", RedisErr, PostgresErr)
 	}
 
 	eventCmdLogger.InfoLog(eventCmdCtx, "EventCmdLogger Initiated", zap.Bool("EventCmdLogger Activation", true))
 	errorLogger.InfoLog(errorLogCtx, "ErrorLogger Initiated", zap.Bool("ErrorLogger Activation", true))
 
-	exiter := &gracefulExit{
-		parentCancelFunc: ctxCancelFunc,
+	exiter := &hex.GracefulExit{
+		ParentCancelFunc: ctxCancelFunc,
 	}
 
     timer := MakeNewTimer()
         
-    return &GameContainer{
+    return &hex.GameContainer{
 		Persister: 	 gsp,
         ErrorLog:    errorLogger,
 		EventCmdLog: eventCmdLogger,

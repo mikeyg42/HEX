@@ -5,18 +5,13 @@ import (
 	"time"
 
 	cache "github.com/go-redis/cache/v9"
+	tm "github.com/mikeyg42/HEX/main"
+	lg "github.com/mikeyg42/HEX/storage"
 	redis "github.com/redis/go-redis/v9"
-	zap "go.uber.org/zap"
 	zapcore "go.uber.org/zap/zapcore"
 	_ "gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	gormlogger "gorm.io/gorm/logger"
 )
-
-type TimerControl struct {
-	startChan chan struct{}
-	stopChan  chan struct{}
-}
 
 type Vertex struct {
 	X int `json:"x" gorm:"type:integer"`
@@ -37,8 +32,8 @@ type MoveLog struct {
 	GameID      string `gorm:"type:varchar(100);index"`
 	MoveCounter int
 	PlayerID    string `gorm:"type:varchar(100)"`
-	xCoordinate string `gorm:"type:varchar(2)"`
-	yCoordinate int
+	XCoordinate string `gorm:"type:varchar(2)"`
+	YCoordinate int
 	Timestamp   int64 `gorm:"autoCreateTime:milli"`
 }
 
@@ -56,7 +51,7 @@ type LockedGame struct {
 type Worker struct {
 	WorkerID string
 	GameChan chan Game //
-	CurrentGameInfo
+
 }
 type Worker_old struct {
 	WorkerID    string
@@ -69,9 +64,9 @@ type Worker_old struct {
 
 type Lobby_old struct {
 	PlayerQueue chan PlayerIdentity
-	workerQueue chan *Worker
-	playerCount int32
-	workerCount int32
+	WorkerQueue chan *Worker
+	PlayerCount int32
+	WorkerCount int32
 }
 
 type Game struct {
@@ -85,8 +80,8 @@ type Result struct {
 }
 
 type Lobby struct {
-	games   chan Game   // this chan will be populated by the matchmaking logic
-	results chan Result // this chan will be populated by the workers relaying the results of the games
+	Games   chan Game   // this chan will be populated by the matchmaking logic
+	Results chan Result // this chan will be populated by the workers relaying the results of the games
 }
 
 //.............. PERSISTENCE ....................//
@@ -94,7 +89,7 @@ type Lobby struct {
 type PostgresGameState struct {
 	DB *gorm.DB
 	// for logging erors specific to redis and postgres
-	Logger Logger
+	Logger lg.Logger
 	// for setting up timeouts
 	Context    context.Context
 	TimeoutDur time.Duration
@@ -104,36 +99,25 @@ type RedisGameState struct {
 	Client  *redis.Client
 	MyCache *cache.Cache
 	// for logging erors specific to redis and postgres
-	Logger Logger
+	Logger lg.Logger
 	// for setting up timeouts
 	Context    context.Context
 	TimeoutDur time.Duration
 }
 
 type GameStatePersister struct {
-	postgres *PostgresGameState
-	redis    *RedisGameState
-	cache    *cache.Cache
+	Postgres *PostgresGameState
+	Redis    *RedisGameState
+	Cache    *cache.Cache
 }
 
 // this struct holds all the dependencies required by other parts of the system. nothing game specific here
 type GameContainer struct {
-	ErrorLog    Logger
-	EventCmdLog Logger
+	ErrorLog    lg.Logger
+	EventCmdLog lg.Logger
 	Persister   *GameStatePersister
-	Timer       *TimerControl
-	Exiter      *gracefulExit
-}
-
-// Dispatcher represents the combined event and command dispatcher.
-type Dispatcher struct {
-	Container       *GameContainer
-	commandHandlers map[string]func(interface{})
-	eventHandlers   map[string]func(interface{})
-	CommandChan     chan interface{}
-	EventChan       chan interface{}
-	// to initiate a game:
-	StartChan chan Command
+	Timer       *tm.TimerControl
+	Exiter      *GracefulExit
 }
 
 type PlayerIdentity struct {
@@ -146,21 +130,14 @@ type PlayerIdentity struct {
 
 //.............. Logger keys ....................//
 
-type eventCmdLoggerKey struct{}
-type errorLoggerKey struct{}
+type EventCmdLoggerKey struct{}
+type ErrorLoggerKey struct{}
 
 type ContextFn func(ctx context.Context) []zapcore.Field
 
-type Logger struct {
-	ZapLogger     *zap.Logger
-	LogLevel      gormlogger.LogLevel
-	SlowThreshold time.Duration
-	Context       ContextFn
-}
-
 // .................. EXIT ........................//
-type gracefulExit struct {
-	parentCancelFunc context.CancelFunc
+type GracefulExit struct {
+	ParentCancelFunc context.CancelFunc
 }
 
 // ................ commands ......................//
@@ -173,7 +150,7 @@ type Command interface {
 	MarshalCmd() ([]byte, error)
 }
 
-var cmdTypeMap = map[string]interface{}{
+var CmdTypeMap = map[string]interface{}{
 	"DeclaringMoveCmd":    &DeclaringMoveCmd{},
 	"LetsStartTheGameCmd": &LetsStartTheGameCmd{},
 	"PlayerForfeitingCmd": &PlayerForfeitingCmd{},
@@ -251,7 +228,7 @@ type SwapTileCmd struct {
 }
 
 // ................ events ......................//
-var eventTypeMap = map[string]interface{}{
+var EventTypeMap = map[string]interface{}{
 	"GameAnnouncementEvent":        &GameAnnouncementEvent{},
 	"DeclaredMoveEvent":            &DeclaredMoveEvent{},
 	"InvalidMoveEvent":             &InvalidMoveEvent{},
@@ -310,13 +287,13 @@ type OfficialMoveEvent struct {
 }
 
 type GameStateUpdate struct {
-	gorm.Model  `redis:"-"`
-	Event       `redis:"-"`
-	GameID      string
-	MoveCounter int
-	PlayerID    string
-	xCoordinate string
-	yCoordinate int
+	gorm.Model       `redis:"-"`
+	Event            `redis:"-"`
+	GameID           string
+	MoveCounter      int
+	PlayerID         string
+	XCoordinate      string
+	YCoordinate      int
 	ConcatenatedMove string `redis:"-"`
 }
 

@@ -10,15 +10,21 @@ import (
 	"time"
 
 	cache "github.com/go-redis/cache/v9"
+	hex "github.com/mikeyg42/HEX/models"
 	redis "github.com/redis/go-redis/v9"
 	zap "go.uber.org/zap"
-	"gorm.io/driver/postgres"
 	_ "gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
+)
+
+var (
+	ListenAddr = "??"
+	RedisAddr  = "localhost:6379"
 )
 
 // .... INITIALIZE
-func InitializePersistence(ctx context.Context) (*GameStatePersister, error, error) {
+func InitializePersistence(ctx context.Context) (*hex.GameStatePersister, error, error) {
 
 	// create connection to postgres, and set up timeout functionality
 	pgs, pgerr := InitializePostgres(ctx)
@@ -37,7 +43,7 @@ func InitializePersistence(ctx context.Context) (*GameStatePersister, error, err
 		return nil, nil, fmt.Errorf("InitError - Cache")
 	}
 
-	gsp := &GameStatePersister{
+	gsp := &hex.GameStatePersister{
 		postgres: pgs,
 		redis:    rgs,
 		cache:    redisCache,
@@ -46,8 +52,8 @@ func InitializePersistence(ctx context.Context) (*GameStatePersister, error, err
 	return gsp, nil, nil
 }
 
-func InitializeRedis(ctx context.Context) (*RedisGameState, error) {
-	errorLogger, ok := ctx.Value(errorLoggerKey{}).(Logger)
+func InitializeRedis(ctx context.Context) (*hex.RedisGameState, error) {
+	errorLogger, ok := ctx.Value(hex.ErrorLoggerKey{}).(*Logger)
 	if !ok {
 		return nil, fmt.Errorf("error getting errorlogger from context")
 	}
@@ -55,7 +61,7 @@ func InitializeRedis(ctx context.Context) (*RedisGameState, error) {
 	// make a connection to redis. we only need one of these per server
 	redisClient, err := getRedisClient(RedisAddr, ctx) // this address is at the moment a global variable
 
-	rgs := &RedisGameState{
+	rgs := &hex.RedisGameState{
 		Client:     redisClient,     // client
 		Logger:     errorLogger,     // logger
 		Context:    ctx,             // ctx
@@ -79,11 +85,9 @@ func getRedisClient(RedisAddress string, ctx context.Context) (*redis.Client, er
 	return client, err
 }
 
-func InitializePostgres(ctx context.Context) (*PostgresGameState, error) {
-	errorLogger, ok := ctx.Value(errorLoggerKey{}).(Logger)
-	if !ok {
-		return nil, fmt.Errorf("error getting logger from context")
-	}
+func InitializePostgres(ctx context.Context) (*hex.PostgresGameState, error) {
+	postgresLogger := &hex.Logger{}
+	postgresLogger = InitLogger("/Users/mikeglendinning/projects/HEX/postgresqlLOG.log", gormlogger.Info)
 
 	//a data source name is made that tells postgresql where to connect to
 	dsn := fmt.Sprintf(
@@ -93,11 +97,11 @@ func InitializePostgres(ctx context.Context) (*PostgresGameState, error) {
 		os.Getenv("DB_NAME"),
 	)
 	// using the dsn and the gorm config file we open a connection to the database
-	db, err := gorm.Open(postgres.New(postgres.Config{
+	db, err := gorm.Open(hex.Postgres.New(hex.Postgres.Config{
 		DSN:                  dsn,
 		PreferSimpleProtocol: true,
 	}), &gorm.Config{
-		Logger: errorLogger,
+		Logger: *postgresLogger,
 	})
 	if err != nil {
 		return nil, err
@@ -113,12 +117,12 @@ func InitializePostgres(ctx context.Context) (*PostgresGameState, error) {
 	sqlDB.SetConnMaxIdleTime(time.Minute * 5)
 
 	// using automigrate with this empty gamestateupdate creates the relational database table for us if it doesn't already exist
-	db.AutoMigrate(&MoveLog{})
+	db.AutoMigrate(&hex.MoveLog{})
 
 	// declare DB as a PostgresGameState
-	return &PostgresGameState{
+	return &hex.PostgresGameState{
 		DB:         db,
-		Logger:     errorLogger,
+		Logger:     *postgresLogger,
 		Context:    ctx, // still the same parentCtx!
 		TimeoutDur: time.Second * 10,
 	}, nil
@@ -148,11 +152,11 @@ func InitializeCache(redisClient *redis.Client) (*cache.Cache, error) {
 	}
 
 	if err := redisCache.Get(ctx_timeout, "testKey", testVal[1]); err != nil {
-		return redisCache, err
+		return nil, fmt.Errorf("cache test failed after initializing: %v", err)
 	}
 
 	if testVal[1] != "HEX" {
-		return nil, fmt.Errorf("cache test failed! target save value: %s, actual save value: %s", testVal[0], testVal[1])
+		return nil, fmt.Errorf("cache test failed after initializing! target save value: %s, actual save value: %s", testVal[0], testVal[1])
 	}
 
 	return redisCache, nil
@@ -160,53 +164,62 @@ func InitializeCache(redisClient *redis.Client) (*cache.Cache, error) {
 
 // PERSIST functions
 
-func (rs *RedisGameState) PersistGraphToRedis(ctx context.Context, graph [][]int, gameID, playerID string) error {
+func PersistGraphToRedis(ctx context.Context, graph [][]int, gameID, playerID string, con *hex.GameContainer) error {
 	key := fmt.Sprintf("adjGraph:%s:%s", gameID, playerID)
 	serializedGraph, err := json.Marshal(graph)
 	if err != nil {
-		return err
+		return fmt.Errorf("redis persist marshalling of graph error: %v", err)
 	}
 
-	_, err = rs.Client.Set(ctx, key, serializedGraph, 0).Result()
-	if err != nil {
-		return err
+	rResult := con.RetryFunc(ctx, func() error {
+		return con.Redis.Client.Set(ctx, key, serializedGraph, 0).Err()
+	})
+
+	if rResult.Err != nil {
+		con.ErrorLog.Error(ctx, "Failed to persist move to Redis after retries", zap.Error(rResult.Err))
+		return rResult.Err
 	}
 
 	return nil
 }
 
-func (rs *RedisGameState) PersistMoveToRedisList(ctx context.Context, newMove Vertex, gameID, playerID string) error {
+func PersistMoveToRedisList(ctx context.Context, newMove hex.Vertex, gameID, playerID string, con *hex.GameContainer) error {
 	moveKey := fmt.Sprintf("moveList:%s:%s", gameID, playerID)
 
 	serializedMove, err := json.Marshal(newMove)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal new move: %w", err)
 	}
 
-	_, err = rs.Client.RPush(ctx, moveKey, serializedMove).Result()
-	if err != nil {
-		return err
+	rResult := con.RetryFunc(ctx, func() error {
+		return con.Redis.Client.RPush(ctx, moveKey, serializedMove).Err()
+	})
+
+	if rResult.Err != nil {
+		con.ErrorLog.Error(ctx, "Failed to persist move to Redis after retries", zap.Error(rResult.Err))
+		return rResult.Err
 	}
 
 	return nil
 }
 
-func (pg *PostgresGameState) PersistGameState_sql(ctx context.Context, update *GameStateUpdate) error {
+func PersistGameState_sql(ctx context.Context, update *hex.GameStateUpdate, pg *hex.PostgresGameState) error {
 
 	txOptions := &sql.TxOptions{
 		Isolation: sql.LevelSerializable,
 	}
+
 	tx := pg.DB.WithContext(ctx).Begin(txOptions)
 	if tx.Error != nil {
 		return tx.Error
 	}
 
-	moveLog := MoveLog{
+	moveLog := hex.MoveLog{
 		GameID:      update.GameID,
 		PlayerID:    update.PlayerID,
 		MoveCounter: update.MoveCounter,
-		xCoordinate: update.xCoordinate,
-		yCoordinate: update.yCoordinate,
+		XCoordinate: update.XCoordinate,
+		YCoordinate: update.YCoordinate,
 	}
 
 	// Save the move to the MoveLog table.
@@ -223,7 +236,7 @@ func (pg *PostgresGameState) PersistGameState_sql(ctx context.Context, update *G
 }
 
 // ..... FETCHING FROM REDIS
-func (gsp *GameStatePersister) FetchGameState(ctx context.Context, newVert Vertex, gameID, playerID string, moveCounter int) ([][]int, []Vertex) {
+func FetchGameState(ctx context.Context, newVert hex.Vertex, gameID, playerID string, moveCounter int, gsp *hex.GameStatePersister) ([][]int, []hex.Vertex) {
 
 	pg := gsp.postgres
 	rs := gsp.redis
@@ -242,11 +255,11 @@ func (gsp *GameStatePersister) FetchGameState(ctx context.Context, newVert Verte
 	return adjGraph, moveList
 }
 
-func (rs *RedisGameState) FetchPlayerMoves(ctx context.Context, gameID, playerID string) ([]Vertex, error) {
+func FetchPlayerMoves(ctx context.Context, gameID, playerID string, rs *hex.RedisGameState) ([]hex.Vertex, error) {
 	// Construct the key for fetching the list of moves.
 	movesKey := fmt.Sprintf("MoveList:%s:%s", gameID, playerID)
 
-	emptyVal := []Vertex{}
+	emptyVal := []hex.Vertex{}
 	ctx_timeout, cancel := context.WithTimeout(rs.Context, rs.TimeoutDur) // for example, 1 minute timeout
 	defer cancel()
 
@@ -258,9 +271,9 @@ func (rs *RedisGameState) FetchPlayerMoves(ctx context.Context, gameID, playerID
 	}
 
 	// Decode each move from its JSON representation.
-	var moves []Vertex
+	var moves []hex.Vertex
 	for _, moveStr := range movesJSON {
-		var move Vertex
+		var move hex.Vertex
 		err = json.Unmarshal([]byte(moveStr), &move)
 		if err != nil {
 			// Handle unmarshalling error somehow?
@@ -272,7 +285,7 @@ func (rs *RedisGameState) FetchPlayerMoves(ctx context.Context, gameID, playerID
 	return moves, nil
 }
 
-func (rs *RedisGameState) FetchAdjacencyGraph(ctx context.Context, gameID, playerID string) ([][]int, error) {
+func FetchAdjacencyGraph(ctx context.Context, gameID, playerID string, rs *hex.RedisGameState) ([][]int, error) {
 	// Construct the key for fetching the adjacency graph.
 	adjacencyGraphKey := fmt.Sprintf("AdjGraph:%s:%s", gameID, playerID)
 
@@ -309,18 +322,22 @@ func (rs *RedisGameState) FetchAdjacencyGraph(ctx context.Context, gameID, playe
 
 // FETCH FROM POSTGRESQL
 
-func (pg *PostgresGameState) FetchGS_sql(ctx context.Context, gameID, playerID string) (xCoords []string, yCoords []int, moveCounter []int, err error) {
-	var moveLogs []MoveLog
+// moveCounter IS A SLICE OF INTEGERS WITH MAX LENGTH OF 230
+
+func FetchGS_sql(ctx context.Context, gameID, playerID string, pg *hex.PostgresGameState) (xCoords []string, yCoords []int, moveCounter []int, err error) {
+	var moveLogs []hex.MoveLog
 
 	if playerID == "all" { // this is called by the DeclaringMoveCommand handler
 		result := pg.DB.Where("game_id = ?", gameID).Order("move_counter asc").Find(&moveLogs)
 		if result.Error != nil {
-			return nil, nil, 0, result.Error
+			moveCounter = make([]int, 0, 230)
+			return nil, nil, moveCounter, result.Error
 		}
 	} else { // this branch is called by the RecreateGS_Postgres and maybe another?
 		result := pg.DB.Where("game_id = ? AND player_id = ?", gameID, playerID).Order("move_counter asc").Find(&moveLogs)
 		if result.Error != nil {
-			return nil, nil, 0, result.Error
+			moveCounter = make([]int, 0, 230)
+			return nil, nil, moveCounter, result.Error
 		}
 	}
 
@@ -328,7 +345,7 @@ func (pg *PostgresGameState) FetchGS_sql(ctx context.Context, gameID, playerID s
 
 	xCoords = make([]string, numMoves)
 	yCoords = make([]int, numMoves)
-	moveCounter = make([]int, numMoves)
+	moveCounter = make([]int, numMoves, 230)
 
 	for i, move := range moveLogs {
 		xCoords[i] = move.xCoordinate
@@ -339,11 +356,11 @@ func (pg *PostgresGameState) FetchGS_sql(ctx context.Context, gameID, playerID s
 	return xCoords, yCoords, moveCounter, nil
 }
 
-func (con *GameContainer) retrieveMoveList(ctx context.Context, gameID string, lg *LockedGame) (map[int]string, error) {
+func retrieveMoveList(ctx context.Context, gameID string, lg *hex.LockedGame, con *hex.GameContainer) (map[int]string, error) {
 	// 1. Try fetching from cache.
 	cacheCtx, cancelCache := context.WithTimeout(ctx, 1*time.Second)
 	defer cancelCache()
-	moveList, err := con.fetchMoveListFromCache(cacheCtx, gameID)
+	moveList, err := fetchMoveListFromCache(cacheCtx, gameID, con)
 	if err == nil && len(moveList) > 1 {
 		return moveList, nil
 	}
@@ -369,7 +386,7 @@ func (con *GameContainer) retrieveMoveList(ctx context.Context, gameID string, l
 	return moveList, nil
 }
 
-func (con *GameContainer) fetchMoveListFromCache(ctx context.Context, gameID string) (map[int]string, error) {
+func fetchMoveListFromCache(ctx context.Context, gameID string, con *hex.GameContainer) (map[int]string, error) {
 	cacheKey := fmt.Sprintf("cache:%d:movelist", gameID)
 	moveList := make(map[int]string)
 	if err := con.Persister.cache.Get(ctx, cacheKey, moveList); err != nil {
@@ -378,7 +395,7 @@ func (con *GameContainer) fetchMoveListFromCache(ctx context.Context, gameID str
 	return moveList, nil
 }
 
-func (con *GameContainer) fetchMoveListFromRedis(ctx context.Context, gameID string, lg *LockedGame) (map[int]string, error) {
+func fetchMoveListFromRedis(ctx context.Context, gameID string, lg *hex.LockedGame, con *hex.GameContainer) (map[int]string, error) {
 
 	ml1, err1 := con.Persister.redis.FetchPlayerMoves(ctx, gameID, lg.Player1.PlayerID)
 	ml2, err2 := con.Persister.redis.FetchPlayerMoves(ctx, gameID, lg.Player2.PlayerID)
@@ -403,7 +420,7 @@ func (con *GameContainer) fetchMoveListFromRedis(ctx context.Context, gameID str
 	return fetchedMoves, nil
 }
 
-func (con *GameContainer) fetchMoveListFromPostgres(ctx context.Context, gameID string) (map[int]string, error) {
+func fetchMoveListFromPostgres(ctx context.Context, gameID string, con *hex.GameContainer) (map[int]string, error) {
 	xCoords, yCoords, moveNumber, err := con.Persister.postgres.FetchGS_sql(ctx, gameID, "all")
 	if err != nil {
 		return nil, err

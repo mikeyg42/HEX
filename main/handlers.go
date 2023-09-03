@@ -1,17 +1,16 @@
 package main
 
-import(
-gorm "gorm.io/gorm"
- "time"
- "fmt"
- "context"
- "strconv"
- "strings"
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
 
- cache "github.com/go-redis/cache/v9"
- redis "github.com/redis/go-redis/v9"
- zap "go.uber.org/zap"
-
+	cache "github.com/go-redis/cache/v9"
+	hex "github.com/mikeyg42/HEX/models"
+	redis "github.com/redis/go-redis/v9"
+	zap "go.uber.org/zap"
 )
 
 //................. HANDLERS .....................//
@@ -27,18 +26,17 @@ func (d *Dispatcher) handleCommandWrapper(cmd interface{}) {
 }
 
 // Event Handler
-func (d *Dispatcher) handleEvent(done <-chan struct{}, event Event, eventPubSub *redis.PubSub) error {
+func (d *Dispatcher) handleEvent(done <-chan struct{}, event hex.Event, eventPubSub *redis.PubSub) error {
 	con := d.Container
-	
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	switch event := event.(type) {
-	case *InvalidMoveEvent:
+	case *hex.InvalidMoveEvent:
 		con.ErrorLog.Warn(ctx, "Received InvalidMoveEvent: %v", event)
 
-
-	case *OfficialMoveEvent:
+	case *hex.OfficialMoveEvent:
 		strs := []string{event.GameID, event.PlayerID, "has made a move:", event.MoveData}
 		con.EventCmdLog.Info(ctx, strings.Join(strs, "/"))
 
@@ -46,12 +44,12 @@ func (d *Dispatcher) handleEvent(done <-chan struct{}, event Event, eventPubSub 
 		con.Timer.StopTimer()
 
 		// This will parse the new move and then publish another message to the event bus that will be picked up by persisting logic and the win condition logic
-		newEvt := con.Handler_OfficialMoveEvt(ctx, event)
+		newEvt := Handler_OfficialMoveEvt(ctx, event, con)
 		d.EventDispatcher(newEvt)
 
-	case *GameStateUpdate:
+	case *hex.GameStateUpdate:
 		// Persist the data and check win conditions
-		newCmd := con.Persister.HandleGameStateUpdate(event)
+		newCmd := HandleGameStateUpdate(event)
 
 		d.CommandDispatcher(newCmd)
 
@@ -64,27 +62,27 @@ func (d *Dispatcher) handleEvent(done <-chan struct{}, event Event, eventPubSub 
 	return nil
 }
 
-func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPubSub *redis.PubSub) {
+func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd hex.Command, commandPubSub *redis.PubSub) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	con := d.Container
 
 	switch cmd := cmd.(type) {
-	case *DeclaringMoveCmd:
+	case *hex.DeclaringMoveCmd:
 		newMoveData := cmd.DeclaredMove
 		moveParts := strings.Split(newMoveData, ".")
-		
+
 		//moveParts[2] is the moveCounter
 		if moveParts[2] == "1" {
 			// the first move is ALWAYS valid, so we can skip all of the below
-			newEvent := &OfficialMoveEvent{
+			newEvent := &hex.OfficialMoveEvent{
 				GameID:    cmd.GameID,
 				PlayerID:  cmd.SourcePlayerID,
 				MoveData:  cmd.DeclaredMove,
 				Timestamp: time.Now(),
 			}
-			con.Timer.StopTimer() 
+			con.Timer.StopTimer()
 			d.EventDispatcher(newEvent)
 			return
 
@@ -92,16 +90,16 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 			// the second move CAN be identical to the first move actually... but I still need to implement the SWAP mechanic so lets ignore this for now
 		}
 
-		lockedGame, ok := allLockedGames[cmd.GameID]
+		lockedGame, ok := AllLockedGames[cmd.GameID]
 		if !ok {
 			// handle this error ?
 		}
-		
+
 		// pull moveList from redis cache, falling back onto successive persistence layers
 		cacheKey := fmt.Sprintf("cache:%d:movelist", cmd.GameID)
 		moveList := make(map[int]string)
-		
-		cacheErr := con.Persister.cache.Once(&cache.Item{
+
+		cacheErr := con.Persister.Cache.Once(&cache.Item{
 			Ctx:   ctx,
 			Key:   cacheKey,
 			Value: &moveList, // The destination where moves will be loaded into
@@ -113,17 +111,17 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 		})
 
 		// handle the cache error
-		if cacheErr !=nil {
+		if cacheErr != nil {
 			panic(cacheErr)
 		}
-		
+
 		// now, from our command, we can look into the moveList and see if the move is valid
-		new_key, err := strconv.Atoi(moveParts[0]) // new_key is the move counter. 
+		new_key, err := strconv.Atoi(moveParts[0]) // new_key is the move counter.
 		if err != nil {
 			con.ErrorLog.ErrorLog(ctx, "Error converting moveCounter to int", zap.Error(err))
 		}
 		new_val := moveParts[2] // new_val is the concatenated x and y coordinates of the most recent move
-		
+
 		maxKey := -1 // Start with an invalid value to ensure real keys replace this.
 
 		// Checking if the value exists in the map and finding the max key.
@@ -136,14 +134,14 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 			if value == new_val {
 				// Value already exists in the moveList.
 				con.ErrorLog.ErrorLog(ctx, "Invalid, duplicate move detected", zap.String("Move", new_val), zap.String("GameID", cmd.GameID), zap.String("PlayerID", cmd.SourcePlayerID))
-				
-				newEvent := &InvalidMoveEvent{
+
+				newEvent := &hex.InvalidMoveEvent{
 					GameID:      cmd.GameID,
 					PlayerID:    cmd.SourcePlayerID,
 					InvalidMove: cmd.DeclaredMove,
 				}
 				d.EventDispatcher(newEvent)
-				
+
 				return
 			}
 		}
@@ -156,18 +154,18 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 			// that means we missed a value. so we should go straight to postgres and try to fetch again. if it happens again, we panic
 		}
 
-		newEvent := &OfficialMoveEvent{
+		newEvent := &hex.OfficialMoveEvent{
 			GameID:    cmd.GameID,
 			PlayerID:  cmd.SourcePlayerID,
 			MoveData:  cmd.DeclaredMove,
 			Timestamp: time.Now(),
-			}
-		
+		}
+
 		d.EventDispatcher(newEvent)
 
-	case *NextTurnStartingCmd:
+	case *hex.NextTurnStartingCmd:
 
-		con.EventCmdLog.Info(ctx, fmt.Sprintf("NextTurnStartingCmd received for game : %s",cmd.GameID))
+		con.EventCmdLog.Info(ctx, fmt.Sprintf("NextTurnStartingCmd received for game : %s", cmd.GameID))
 
 		// Only Place you start the timer!
 		con.Timer.StartTimer()
@@ -184,7 +182,7 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 		}
 		d.EventDispatcher(newEvt)
 
-	case *PlayerForfeitingCmd:
+	case *hex.PlayerForfeitingCmd:
 
 		con.EventCmdLog.Info(ctx, "Player forfeited the game", zap.String("PlayerID", cmd.SourcePlayerID), zap.String("GameID", cmd.GameID), zap.String("ForfeitReason", cmd.Reason))
 
@@ -193,9 +191,9 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 		// Determine who the winner is via the allLockedGames struct
 		lg := allLockedGames[cmd.GameID]
 		var newCmd *EndingGameCmd
-		
-		winCond := []string{"Forfeit: ",cmd.Reason}
-		winCondition := strings.Join(winCond,"")
+
+		winCond := []string{"Forfeit: ", cmd.Reason}
+		winCondition := strings.Join(winCond, "")
 
 		if cmd.SourcePlayerID == lg.Player1.PlayerID {
 			newCmd = &EndingGameCmd{
@@ -216,7 +214,7 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 		}
 		d.EventDispatcher(newCmd)
 
-	case *LetsStartTheGameCmd: // this command is generated by the LockTheGame function found in the workerpool code
+	case *hex.LetsStartTheGameCmd: // this command is generated by the LockTheGame function found in the workerpool code
 
 		// Create a new channel for this game instance
 		gameID := cmd.GameID
@@ -249,14 +247,14 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd Command, commandPub
 	}
 }
 
-func (con *GameContainer) fetchMoveList(ctx context.Context, GameID string, lockedGame *LockedGame) (map[int]string, bool) {
+func fetchMoveList(ctx context.Context, GameID string, lockedGame *hex.LockedGame, con *hex.GameContainer) (map[int]string, bool) {
 
-	pipe := con.Persister.redis.Client.Pipeline()
+	pipe := con.Persister.Redis.Client.Pipeline()
 
 	// Prepare commands for moves1 and moves2
 	getMoves1 := pipe.HGetAll(ctx, fmt.Sprintf("MoveList:%s:%s", GameID, lockedGame.Player1.PlayerID))
 	getMoves2 := pipe.HGetAll(ctx, fmt.Sprintf("MoveList:%s:%s", GameID, lockedGame.Player2.PlayerID))
-	
+
 	// Execute pipelined commands
 	_, err := pipe.Exec(ctx)
 	if err != nil {
@@ -264,7 +262,7 @@ func (con *GameContainer) fetchMoveList(ctx context.Context, GameID string, lock
 
 		return nil, false
 	}
-	
+
 	// Fetch results
 	moves1, err1 := getMoves1.Result()
 	moves2, err2 := getMoves2.Result()
@@ -286,7 +284,7 @@ func (con *GameContainer) fetchMoveList(ctx context.Context, GameID string, lock
 	}
 
 	// this below effectively replaced the two skipped errors within the above loops
-	if len(allMoves)== 0 || len(allMoves) != len(moves1)+len(moves2) {
+	if len(allMoves) == 0 || len(allMoves) != len(moves1)+len(moves2) {
 		con.ErrorLog.InfoLog(ctx, "error fetching moves from redis: %v", zap.String("redis error", "combining maps"))
 		return nil, false
 	}
@@ -294,8 +292,7 @@ func (con *GameContainer) fetchMoveList(ctx context.Context, GameID string, lock
 	return allMoves, true
 }
 
-
-func (con *GameContainer) parseOfficialMoveEvt(ctx context.Context, e *OfficialMoveEvent) (*GameStateUpdate, error) {
+func parseOfficialMoveEvt(ctx context.Context, e *hex.OfficialMoveEvent, con *hex.GameContainer) (*hex.GameStateUpdate, error) {
 	// parses the OfficialMoveEvent and returns a GameStateUpdate struct, the next event in the progresssion, this struct is saveable in DB
 	logger := con.ErrorLog
 	moveParts := strings.Split(e.MoveData, ".")
@@ -327,20 +324,20 @@ func (con *GameContainer) parseOfficialMoveEvt(ctx context.Context, e *OfficialM
 		return nil, fmt.Errorf("invalid yCoordinate: %w", err)
 	}
 
-	update := &GameStateUpdate{
+	update := &hex.GameStateUpdate{
 		GameID:           gameID,
 		PlayerID:         playerID,
 		MoveCounter:      moveCounter,
-		xCoordinate:      xCoordinate,
-		yCoordinate:      yCoordinate,
+		XCoordinate:      xCoordinate,
+		YCoordinate:      yCoordinate,
 		ConcatenatedMove: coordinates,
 	}
 	return update, nil
 }
 
-func (con *GameContainer) Handler_OfficialMoveEvt(ctx context.Context, evt *OfficialMoveEvent) *GameStateUpdate {
+func Handler_OfficialMoveEvt(ctx context.Context, evt *hex.OfficialMoveEvent, con *hex.GameContainer) *hex.GameStateUpdate {
 
-	newEvt, err := con.parseOfficialMoveEvt(ctx, evt)
+	newEvt, err := parseOfficialMoveEvt(ctx, evt, con)
 	if err != nil {
 		con.ErrorLog.ErrorLog(ctx, "error extracting move data", zap.Error(err))
 	}

@@ -5,17 +5,16 @@ import (
 	"time"
 )
 
-// I've duplicated this in the  Models package to reduce size.
-// ...,if you change this , be sure to change there too!!
+
 type TimerControl struct {
-	startChan chan struct{}
-	stopChan  chan struct{}
+	StartChan chan struct{}
+	StopChan  chan struct{}
 }
 
 func MakeNewTimer() *TimerControl {
 	tc := &TimerControl{
-		startChan: make(chan struct{}),
-		stopChan:  make(chan struct{}),
+		StartChan: make(chan struct{}),
+		StopChan:  make(chan struct{}),
 	}
 
 	go tc.ManageTimer()
@@ -24,23 +23,23 @@ func MakeNewTimer() *TimerControl {
 }
 
 func (tc *TimerControl) StopTimer() {
-	tc.stopChan <- struct{}{}
+	tc.StopChan <- struct{}{}
 }
 
 func (tc *TimerControl) StartTimer() {
-	tc.startChan <- struct{}{}
+	tc.StartChan <- struct{}{}
 }
 
 func (tc *TimerControl) ManageTimer() {
 	var timer *time.Timer
 	for {
 		select {
-		case <-tc.startChan:
+		case <-tc.StartChan:
 			if timer != nil {
 				timer.Stop()
 			}
 			timer = time.NewTimer(30 * time.Second)
-		case <-tc.stopChan:
+		case <-tc.StopChan:
 			if timer != nil {
 				timer.Stop()
 				fmt.Println("Turn Complete")

@@ -72,7 +72,7 @@ func (con *GameContainer) HandleGameStateUpdate(newMove *GameStateUpdate) interf
 			loserID = lg.Player2.PlayerID
 		}
 
-		newCmd := &EndingGameCmd{
+		newCmd := &hex.EndingGameCmd{
 			GameID:       gameID,
 			WinnerID:     playerID,
 			LoserID:      loserID,
@@ -86,7 +86,7 @@ func (con *GameContainer) HandleGameStateUpdate(newMove *GameStateUpdate) interf
 			nextPlayer = "P1"
 		}
 
-		newCmd := &NextTurnStartingCmd{
+		newCmd := &hex.NextTurnStartingCmd{
 			GameID:             gameID,
 			PriorPlayerID:      playerID,
 			NextPlayerID:       nextPlayer,

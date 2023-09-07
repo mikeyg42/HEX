@@ -5,13 +5,21 @@ import (
 	"time"
 
 	cache "github.com/go-redis/cache/v9"
-	tm "github.com/mikeyg42/HEX/main"
-	lg "github.com/mikeyg42/HEX/storage"
 	redis "github.com/redis/go-redis/v9"
 	zapcore "go.uber.org/zap/zapcore"
 	_ "gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
+
+type TimerController interface {
+	StopTimer()
+	StartTimer()
+}
+
+type LogController interface {
+	ErrorLog(ctx context.Context, msg string, fields ...zapcore.Field)
+	InfoLog(ctx context.Context, msg string, fields ...zapcore.Field)
+}
 
 type Vertex struct {
 	X int `json:"x" gorm:"type:integer"`
@@ -25,8 +33,10 @@ type GameState struct {
 	AdjacencyGraph1 [][]int  `json:"adjacencyGraph1" gorm:"type:jsonb"`
 	Player2Moves    []Vertex `gorm:"type:jsonb"`
 	AdjacencyGraph2 [][]int  `json:"adjacencyGraph2" gorm:"type:jsonb"`
+    
+    Persister   *GameStatePersister // add this
+	Timer       TimerController
 }
-
 type MoveLog struct {
 	ID          uint   `gorm:"primaryKey"`
 	GameID      string `gorm:"type:varchar(100);index"`
@@ -47,12 +57,18 @@ type LockedGame struct {
 	Player2       PlayerIdentity
 }
 
-// newer= draft of workers
+// newer draft of workers+ lobby
 type Worker struct {
 	WorkerID string
 	GameChan chan Game //
 
 }
+
+type Lobby struct {
+	Games   chan Game   // this chan will be populated by the matchmaking logic
+	Results chan Result // this chan will be populated by the workers relaying the results of the games
+}
+
 type Worker_old struct {
 	WorkerID    string
 	GameID      string
@@ -79,17 +95,12 @@ type Result struct {
 	Result interface{}
 }
 
-type Lobby struct {
-	Games   chan Game   // this chan will be populated by the matchmaking logic
-	Results chan Result // this chan will be populated by the workers relaying the results of the games
-}
-
 //.............. PERSISTENCE ....................//
 
 type PostgresGameState struct {
 	DB *gorm.DB
 	// for logging erors specific to redis and postgres
-	Logger lg.Logger
+	Logger LogController
 	// for setting up timeouts
 	Context    context.Context
 	TimeoutDur time.Duration
@@ -99,7 +110,7 @@ type RedisGameState struct {
 	Client  *redis.Client
 	MyCache *cache.Cache
 	// for logging erors specific to redis and postgres
-	Logger lg.Logger
+	Logger LogController
 	// for setting up timeouts
 	Context    context.Context
 	TimeoutDur time.Duration
@@ -113,10 +124,9 @@ type GameStatePersister struct {
 
 // this struct holds all the dependencies required by other parts of the system. nothing game specific here
 type GameContainer struct {
-	ErrorLog    lg.Logger
-	EventCmdLog lg.Logger
+	ErrorLog    LogController
+	EventCmdLog LogController
 	Persister   *GameStatePersister
-	Timer       *tm.TimerControl
 	Exiter      *GracefulExit
 }
 

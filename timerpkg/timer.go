@@ -1,10 +1,11 @@
-package main
+package timerpkg
 
 import (
 	"fmt"
 	"time"
 )
 
+const turnTime = 30  * time.Second
 
 type TimerControl struct {
 	StartChan chan struct{}
@@ -38,7 +39,7 @@ func (tc *TimerControl) ManageTimer() {
 			if timer != nil {
 				timer.Stop()
 			}
-			timer = time.NewTimer(30 * time.Second)
+			timer = time.NewTimer(turnTime)
 		case <-tc.StopChan:
 			if timer != nil {
 				timer.Stop()

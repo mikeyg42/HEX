@@ -4,20 +4,28 @@ import (
 	"context"
 	"fmt"
 	"time"
-    _ "github.com/mikeyg42/HEX/models"
-
+    hex "github.com/mikeyg42/HEX/models"
+	storage "github.com/mikeyg42/HEX/storage"
 	zap "go.uber.org/zap"
-	"gorm.io/gorm"
+	ti "github.com/mikeyg42/HEX/timerpkg"
+	
 )
 
 const SideLenGameboard = 15
 const maxRetries = 3
 
-// ..... HANDLERS ............//
+type GameState struct {
+Persister *hex.GameStatePersister
+Errlong *storage.Logger
+GameID string
+Timer ti.TimerControl  
+}
 
-func (con *GameContainer) HandleGameStateUpdate(newMove *GameStateUpdate) interface{} {
-	pg := con.Persister.postgres
-	rs := con.Persister.redis
+
+
+func (gs *GameState) HandleGameStateUpdate(newMove *hex.GameStateUpdate) interface{} {
+	pg := gs.Persister.Postgres
+	rs := gs.Persister.Redis
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
 
@@ -25,16 +33,10 @@ func (con *GameContainer) HandleGameStateUpdate(newMove *GameStateUpdate) interf
 
 	moveCounter := newMove.MoveCounter
 	gameID := newMove.GameID
-	xCoord := newMove.xCoordinate
-	yCoord := newMove.yCoordinate
+	xCoord := newMove.XCoordinate
+	yCoord := newMove.YCoordinate
 
-	// FIX THIS!!
-	yn_rotateboard := true
-	if moveCounter%2 == 0 {
-		yn_rotateboard = false
-	}
-
-	newVert, err := convertToTypeVertex(xCoord, yCoord, yn_rotateboard)
+	newVert, err := convertToTypeVertex(xCoord, yCoord)
 	if err != nil {
 		//handle
 	}
@@ -105,60 +107,61 @@ type RResult struct {
 }
 
 type FuncWithErrorOnly func() error
-type FuncWithResult func() *RResult
+type FuncWithResultAndError func() *RResult
 
-func (con *GameContainer) RetryFunc(ctx context.Context, function interface{}) *RResult {
-	var lastErr error
-	var msg string
+func (gs *GameState) RetryFunc(ctx context.Context, function interface{}) *RResult {
+	var msg string = ""
 
 	for i := 0; i < maxRetries; i++ {
-		switch f := function.(type) {
-		case FuncWithErrorOnly:
-			lastErr = f()
-		case FuncWithResult:
-			result := f()
-			lastErr = result.Err
-			msg = result.Message
-		default:
-			return &RResult{Err: fmt.Errorf("unsupported function type")}
-		}
+		var lastErr error = nil
 
-		if lastErr == nil {
-			con.ErrorLog.InfoLog(ctx, "RetryFunc SUCCESS", zap.Int("RetryFunc iteration num", i))
-			return &RResult{
-				Err:     nil,
-				Message: msg,
+		switch f := function.(type) {
+			case FuncWithErrorOnly:
+				lastErr = f()
+
+			case FuncWithResultAndError:
+				result := f()
+				lastErr = result.Err
+				msg = result.Message
+			
+			if lastErr == nil {
+				gs.Errlong.InfoLog(ctx, "RetryFunc SUCCESS", zap.Int("RetryFunc iteration num", i))
+				return &RResult{
+					Err:     lastErr,
+					Message: msg,
+				}
 			}
 		}
-
-		con.ErrorLog.InfoLog(ctx, fmt.Sprintf("Attempt %d failed with error: %v. Retrying...\n", i+1, lastErr), zap.Int("RetryFunc iteration num", i))
+		
+		gs.Errlong.InfoLog(ctx, fmt.Sprintf("Attempt %d failed with error: %v. Retrying...\n", i+1, lastErr), zap.Int("RetryFunc iteration num", i))
 		// Introduce a delay with exponential backoff
-		time.Sleep(time.Second * time.Duration(1<<i))
+	
+		time.Sleep(time.Millisecond * 100 * time.Duration(1<<i))
+	
 	}
-
 	err := fmt.Errorf("failed after %d attempts. Last error: %v", maxRetries, lastErr)
-
+	
 	return &RResult{
 		Err:     err,
 		Message: msg,
 	}
 }
 
-func (pg *PostgresGameState) RecreateGS_Postgres(ctx context.Context, playerID, gameID string, moveCounter int) ([][]int, []Vertex, error) {
+func (gs *GameState) RecreateGS_Postgres(ctx context.Context, playerID, gameID string, moveCounter int) ([][]int, []hex.Vertex, error) {
+	
 	// this function assumes that you have NOT yet incorporated the newest move into this postgres. but moveCounter input is that of the new move yet to be added
 	adjGraph := [][]int{{0, 0}, {0, 0}}
-	moveList := []Vertex{}
+	moveList := []hex.Vertex{}
 
 	// Fetch moves that match the gameID and the playerID and with a moveCounter less than the passed moveCounter.
-	xCoords, yCoords, moveCounterCheck, err := pg.FetchGS_sql(ctx, gameID, playerID)
+	xCoords, yCoords, moveCounterCheck, err := storage.FetchGS_sql(ctx, gameID, playerID, gs.Persister.Postgres)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	// Return error if we have moves greater than or equal to moveCounter.
-	if moveCounterCheck >= moveCounter {
+	if len(moveCounterCheck)>1 || moveCounterCheck[0] >= moveCounter {
 		// CHECK FOR DUPLICATE ENTRIES?
-
 		return nil, nil, fmt.Errorf("found more moves than anticipated")
 	}
 
@@ -179,14 +182,8 @@ func (pg *PostgresGameState) RecreateGS_Postgres(ctx context.Context, playerID, 
 		}
 	}
 
-	// Incorporate the moves
-	yn_rotateboard := true
-	if moveCounter%2 == 0 {
-		yn_rotateboard = false
-	}
-
 	for i := 0; i < len(xCoords); i++ {
-		modVert, err := convertToTypeVertex(xCoords[i], yCoords[i], yn_rotateboard)
+		modVert, err := convertToTypeVertex(xCoords[i], yCoords[i])
 		if err != nil {
 			return nil, nil, err
 		}
@@ -199,7 +196,7 @@ func (pg *PostgresGameState) RecreateGS_Postgres(ctx context.Context, playerID, 
 
 // ..... CHECKING FOR WIN CONDITION
 
-func evalWinCondition(adjG [][]int, moveList []Vertex) bool {
+func evalWinCondition(adjG [][]int, moveList []hex.Vertex) bool {
 	numMoves := len(moveList)
 	numRows := numMoves + 2
 	numCols := numRows
@@ -225,7 +222,7 @@ func evalWinCondition(adjG [][]int, moveList []Vertex) bool {
 
 	thinnedAdj := make([][]int, len(adjG))
 	copy(thinnedAdj, adjG)
-	thinnedMoveList := make([]Vertex, numMoves)
+	thinnedMoveList := make([]hex.Vertex, numMoves)
 	copy(thinnedMoveList, moveList)
 
 	for {
@@ -277,9 +274,12 @@ func evalWinCondition(adjG [][]int, moveList []Vertex) bool {
 	}
 }
 
+
+
+//............................. //
 // ..... Helper functions ..... //
 
-func IncorporateNewVert(ctx context.Context, moveList []Vertex, adjGraph [][]int, newVert Vertex) ([][]int, []Vertex) {
+func IncorporateNewVert(ctx context.Context, moveList []hex.Vertex, adjGraph [][]int, newVert hex.Vertex) ([][]int, []hex.Vertex) {
 	// Update Moves
 	updatedMoveList := append(moveList, newVert)
 	moveCount := len(updatedMoveList)
@@ -293,7 +293,7 @@ func IncorporateNewVert(ctx context.Context, moveList []Vertex, adjGraph [][]int
 		newAdjacencyGraph[i] = make([]int, sizeNewAdj)
 	}
 
-	// Copy values from the old adjacency graph
+	// Copy values from the old adjacency graph	
 	for i := 0; i < len(adjGraph); i++ {
 		copy(newAdjacencyGraph[i], adjGraph[i])
 	}
@@ -326,8 +326,8 @@ func IncorporateNewVert(ctx context.Context, moveList []Vertex, adjGraph [][]int
 	return newAdjacencyGraph, updatedMoveList
 }
 
-func getAdjacentVertices(vertex Vertex) []Vertex {
-	return []Vertex{
+func getAdjacentVertices(vertex hex.Vertex) []hex.Vertex {
+	return []hex.Vertex{
 		{X: vertex.X - 1, Y: vertex.Y + 1},
 		{X: vertex.X - 1, Y: vertex.Y},
 		{X: vertex.X, Y: vertex.Y - 1},
@@ -359,7 +359,7 @@ func containsInt(items []int, item int) bool {
 	return false
 }
 
-func containsVert(vertices []Vertex, target Vertex) bool {
+func containsVert(vertices []hex.Vertex, target hex.Vertex) bool {
 	for _, v := range vertices {
 		if v.X == target.X && v.Y == target.Y {
 			return true
@@ -386,8 +386,8 @@ func removeRows(s [][]int, indices []int) [][]int {
 	return result
 }
 
-func removeVertices(s []Vertex, indices []int) []Vertex {
-	result := make([]Vertex, 0)
+func removeVertices(s []hex.Vertex, indices []int) []hex.Vertex {
+	result := make([]hex.Vertex, 0)
 	for i, vertex := range s {
 		if containsInt(indices, i) {
 			continue
@@ -445,16 +445,12 @@ func convertToInt(xCoord string) (int, error) {
 	return int(xCoord[0]) - int('A'), nil
 }
 
-func convertToTypeVertex(xCoord string, yCoord int, yes_rotate bool) (Vertex, error) {
+func convertToTypeVertex(xCoord string, yCoord int) (hex.Vertex, error) {
 	x, err := convertToInt(xCoord)
 	if err != nil {
-		return Vertex{}, err
+		return hex.Vertex{}, err
 	}
-	if yes_rotate {
-		return Vertex{X: yCoord, Y: x}, nil
-	} else {
-		return Vertex{X: x, Y: yCoord}, nil
-	}
+		return hex.Vertex{X: x, Y: yCoord}, nil
 }
 
 func largestKey(m []string) int {

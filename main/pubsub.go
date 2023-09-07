@@ -116,14 +116,11 @@ func NewGameContainer(ctx context.Context, ctxCancelFunc context.CancelFunc) (*h
 	exiter := &hex.GracefulExit{
 		ParentCancelFunc: ctxCancelFunc,
 	}
-
-    timer := MakeNewTimer()
         
     return &hex.GameContainer{
 		Persister: 	 gsp,
         ErrorLog:    errorLogger,
 		EventCmdLog: eventCmdLogger,
-        Timer:       timer,
 		Exiter: 	 exiter,
     }, nil
 }

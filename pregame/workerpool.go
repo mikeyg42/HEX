@@ -9,7 +9,9 @@ import (
 	"github.com/google/uuid"
 	redis "github.com/redis/go-redis/v9"
 	zap "go.uber.org/zap"
-	_"github.com/mikeyg42/HEX/models"
+	hex "github.com/mikeyg42/HEX/models"
+	timer "github.com/mikeyg42/HEX/timerpkg"
+	logger "github.com/mikeyg42/HEX/storage"
 )
  
 // Define a shared map to keep track of locked games
@@ -21,7 +23,15 @@ var (
 	ackMutex        = sync.Mutex{}
 )
 
-func GenerateUniqueGameID(db *PostgresGameState, w *Worker) func() *RResult {
+type GameState struct {
+	Worker string
+	Persister *hex.GameStatePersister
+	Errlog  *logger.Logger
+	GameID string
+	Timer *timer.TimerControl
+}
+
+func (w *Worked)GenerateUniqueGameID(db *hex.PostgresGameState) func() *hex.RResult {
 	return func() *RResult {
 		var gameID string
 
@@ -56,15 +66,37 @@ func NewWorker(id string) *Worker {
     // Initialize the Worker
 }
 
-func (w *Worker) StartGame(player1, player2 PlayerIdentity) {
-    game := NewGame(player1, player2)
-    go w.runGame(game)
+
+func (w *Worker) NewGame(playerA, playerB hex.PlayerIdentity, con *hex.GameContainer) hex.GameState {
+
+gameID := w.GenerateUniqueGameID(con.Persister.Postgres)
+gs := w.InitializeGS(con, gameID)
+commandPubSub := gs.Persister.Redis.Client.Subscribe(ctx, "commands")
+eventPubSub := gs.Persister.Redis.Client.Subscribe(ctx, "events")
+
+go w.runGame(game) 
+//async stuff
+
+return gs
 }
+
+
+func (w *Worker) InitializeGS(con *hex.GameContainer, gameID string) *GameState {
+	return &GameState{
+		Worker: w.WorkerID,
+		Persister: con.Persister,
+		Errlog: con.ErrorLog,
+		GameID: gameID,
+		timer: ti.MakeNewTimer(),
+	}
+} 
+
 
 func (w *Worker) runGame(game Game) {
     // Handle game logic
     // Wait for the game to finish or receive external signals if needed
     // Once game is finished, inform the Lobby so the worker can be reused
+
 }
 
 

@@ -11,6 +11,7 @@ import (
 	hex "github.com/mikeyg42/HEX/models"
 	redis "github.com/redis/go-redis/v9"
 	zap "go.uber.org/zap"
+	timer "github.com/mikeyg42/HEX/timerpkg"
 )
 
 //................. HANDLERS .....................//
@@ -34,14 +35,14 @@ func (d *Dispatcher) handleEvent(done <-chan struct{}, event hex.Event, eventPub
 
 	switch event := event.(type) {
 	case *hex.InvalidMoveEvent:
-		con.ErrorLog.Warn(ctx, "Received InvalidMoveEvent: %v", event)
+		con.ErrorLog.InfoLog(ctx, "Received InvalidMoveEvent: %v", event)
 
 	case *hex.OfficialMoveEvent:
 		strs := []string{event.GameID, event.PlayerID, "has made a move:", event.MoveData}
-		con.EventCmdLog.Info(ctx, strings.Join(strs, "/"))
+		con.EventCmdLog.InfoLog(ctx, strings.Join(strs, "/"))
 
 		// To get here means the player's move was valid! Therefore, we can stop their countdown. we will start new one after processing this move
-		con.Timer.StopTimer()
+		timer.StopTimer()
 
 		// This will parse the new move and then publish another message to the event bus that will be picked up by persisting logic and the win condition logic
 		newEvt := Handler_OfficialMoveEvt(ctx, event, con)
@@ -190,20 +191,20 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd hex.Command, comman
 
 		// Determine who the winner is via the allLockedGames struct
 		lg := allLockedGames[cmd.GameID]
-		var newCmd *EndingGameCmd
+		var newCmd *hex.EndingGameCmd
 
 		winCond := []string{"Forfeit: ", cmd.Reason}
 		winCondition := strings.Join(winCond, "")
 
 		if cmd.SourcePlayerID == lg.Player1.PlayerID {
-			newCmd = &EndingGameCmd{
+			newCmd = &hex.EndingGameCmd{
 				GameID:       cmd.GameID,
 				LoserID:      cmd.SourcePlayerID,
 				WinnerID:     lg.Player2.PlayerID,
 				WinCondition: winCondition,
 			}
 		} else if cmd.SourcePlayerID == lg.Player2.PlayerID {
-			newCmd = &EndingGameCmd{
+			newCmd = &hex.EndingGameCmd{
 				GameID:       cmd.GameID,
 				LoserID:      cmd.SourcePlayerID,
 				WinnerID:     lg.Player1.PlayerID,

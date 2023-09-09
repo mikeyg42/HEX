@@ -3,31 +3,38 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
-    hex "github.com/mikeyg42/HEX/models"
+
+	hex "github.com/mikeyg42/HEX/models"
+	"github.com/mikeyg42/HEX/retry"
 	storage "github.com/mikeyg42/HEX/storage"
-	zap "go.uber.org/zap"
 	ti "github.com/mikeyg42/HEX/timerpkg"
-	
+	zap "go.uber.org/zap"
+	gormlogger "gorm.io/gorm/logger"
+
 )
 
 const SideLenGameboard = 15
 const maxRetries = 3
 
 type GameState struct {
-Persister *hex.GameStatePersister
-Errlong *storage.Logger
-GameID string
-Timer ti.TimerControl  
+	Persister *hex.GameStatePersister
+	Errlong   *storage.Logger
+	GameID    string
+	Timer     ti.TimerControl
 }
-
-
 
 func (gs *GameState) HandleGameStateUpdate(newMove *hex.GameStateUpdate) interface{} {
 	pg := gs.Persister.Postgres
 	rs := gs.Persister.Redis
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
+	defer cancelFunc()
+
+	// Assuming you have a zap logger instance called `logger`
+	logger := storage.InitLogger("path/to/logs/gamestate.log", gormlogger.LogLevel(0))
+	ctx = context.WithValue(ctx, "logger", logger)
 
 	playerID := newMove.PlayerID
 
@@ -42,26 +49,46 @@ func (gs *GameState) HandleGameStateUpdate(newMove *hex.GameStateUpdate) interfa
 	}
 
 	// retrieve adjacency matrix and movelist from redis, with postgres as fall back option
-	oldAdjG, oldMoveList := con.Persister.FetchGameState(ctx, newVert, gameID, playerID, moveCounter)
+	oldAdjG, oldMoveList := storage.FetchGameState(ctx, newVert, gameID, playerID, moveCounter, gs.Persister)
 	newAdjG, newMoveList := IncorporateNewVert(ctx, oldMoveList, oldAdjG, newVert)
 
 	// DONE UPDATING GAMESTATE! NOW WE USE IT
 	win_yn := evalWinCondition(newAdjG, newMoveList)
-	
+
 	// ... AND SAVE IT
-	err = pg.PersistGameState_sql(ctx, newMove)
-	
+	err = storage.PersistGameState_sql(ctx, newMove, pg)
 	if err != nil {
 		// Handle the error
 	}
-	// adjacency matrix
-	if err := rs.PersistGraphToRedis(ctx, newAdjG, gameID, playerID); err != nil {
-		con.RetryFunc(ctx,func() error { return rs.PersistGraphToRedis(ctx, newAdjG, gameID, playerID) })
-	}
-	// move List
-	if err := rs.PersistMoveToRedisList(ctx, newVert, gameID, playerID); err != nil {
-		con.RetryFunc(ctx,func() error { return rs.PersistMoveToRedisList(ctx, newVert, gameID, playerID) })
-	}
+
+	var wg sync.WaitGroup
+	wg.Add(2) // two persistence actions
+
+	go func() {
+		defer wg.Done()
+		r := retry.RetryFunc(ctx, func() (string, interface{}, error) {
+			err := storage.PersistGraphToRedis(ctx, newAdjG, gameID, playerID, rs)
+			return "", nil, err
+		})
+		if r.Err != nil {
+			// Handle the error, possibly by logging it
+			logger.Error(ctx, "Failed to persist graph to Redis: %v", zap.Error(r.Err))
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		r := retry.RetryFunc(ctx, func() (string, interface{}, error) {
+			err := storage.PersistMoveToRedisList(ctx, newVert, gameID, playerID, rs)
+			return "", nil, err
+		})
+		if r.Err != nil {
+			// Handle the error, possibly by logging it
+			logger.Error(ctx, "Failed to persist move List to Redis: %v", zap.Error(r.Err))
+		}
+	}()
+
+	wg.Wait() // Wait for both persistence actions to complete
 
 	// cancel the context for this event handling
 	cancelFunc()
@@ -74,13 +101,13 @@ func (gs *GameState) HandleGameStateUpdate(newMove *hex.GameStateUpdate) interfa
 			loserID = lg.Player2.PlayerID
 		}
 
-		newCmd := &hex.EndingGameCmd{
+		newEvt := &hex.GameEndEvent{
 			GameID:       gameID,
 			WinnerID:     playerID,
 			LoserID:      loserID,
 			WinCondition: "A True Win",
 		}
-		return newCmd
+		return newEvt
 
 	} else {
 		nextPlayer := "P2"
@@ -111,19 +138,19 @@ type FuncWithResultAndError func() *RResult
 
 func (gs *GameState) RetryFunc(ctx context.Context, function interface{}) *RResult {
 	var msg string = ""
+	var lastErr error = nil
 
 	for i := 0; i < maxRetries; i++ {
-		var lastErr error = nil
-
+	
 		switch f := function.(type) {
-			case FuncWithErrorOnly:
-				lastErr = f()
+		case FuncWithErrorOnly:
+			lastErr = f()
 
-			case FuncWithResultAndError:
-				result := f()
-				lastErr = result.Err
-				msg = result.Message
-			
+		case FuncWithResultAndError:
+			result := f()
+			lastErr = result.Err
+			msg = result.Message
+
 			if lastErr == nil {
 				gs.Errlong.InfoLog(ctx, "RetryFunc SUCCESS", zap.Int("RetryFunc iteration num", i))
 				return &RResult{
@@ -132,15 +159,15 @@ func (gs *GameState) RetryFunc(ctx context.Context, function interface{}) *RResu
 				}
 			}
 		}
-		
+
 		gs.Errlong.InfoLog(ctx, fmt.Sprintf("Attempt %d failed with error: %v. Retrying...\n", i+1, lastErr), zap.Int("RetryFunc iteration num", i))
 		// Introduce a delay with exponential backoff
-	
+
 		time.Sleep(time.Millisecond * 100 * time.Duration(1<<i))
-	
+
 	}
 	err := fmt.Errorf("failed after %d attempts. Last error: %v", maxRetries, lastErr)
-	
+
 	return &RResult{
 		Err:     err,
 		Message: msg,
@@ -148,7 +175,7 @@ func (gs *GameState) RetryFunc(ctx context.Context, function interface{}) *RResu
 }
 
 func (gs *GameState) RecreateGS_Postgres(ctx context.Context, playerID, gameID string, moveCounter int) ([][]int, []hex.Vertex, error) {
-	
+
 	// this function assumes that you have NOT yet incorporated the newest move into this postgres. but moveCounter input is that of the new move yet to be added
 	adjGraph := [][]int{{0, 0}, {0, 0}}
 	moveList := []hex.Vertex{}
@@ -160,7 +187,7 @@ func (gs *GameState) RecreateGS_Postgres(ctx context.Context, playerID, gameID s
 	}
 
 	// Return error if we have moves greater than or equal to moveCounter.
-	if len(moveCounterCheck)>1 || moveCounterCheck[0] >= moveCounter {
+	if len(moveCounterCheck) > 1 || moveCounterCheck[0] >= moveCounter {
 		// CHECK FOR DUPLICATE ENTRIES?
 		return nil, nil, fmt.Errorf("found more moves than anticipated")
 	}
@@ -170,7 +197,7 @@ func (gs *GameState) RecreateGS_Postgres(ctx context.Context, playerID, gameID s
 		case 0:
 			return adjGraph, moveList, nil
 		case 1:
-			vert, err := convertToTypeVertex(xCoords[0], yCoords[0], false)
+			vert, err := convertToTypeVertex(xCoords[0], yCoords[0])
 			if err != nil {
 				return nil, nil, err
 			}
@@ -274,8 +301,6 @@ func evalWinCondition(adjG [][]int, moveList []hex.Vertex) bool {
 	}
 }
 
-
-
 //............................. //
 // ..... Helper functions ..... //
 
@@ -293,7 +318,7 @@ func IncorporateNewVert(ctx context.Context, moveList []hex.Vertex, adjGraph [][
 		newAdjacencyGraph[i] = make([]int, sizeNewAdj)
 	}
 
-	// Copy values from the old adjacency graph	
+	// Copy values from the old adjacency graph
 	for i := 0; i < len(adjGraph); i++ {
 		copy(newAdjacencyGraph[i], adjGraph[i])
 	}
@@ -450,7 +475,7 @@ func convertToTypeVertex(xCoord string, yCoord int) (hex.Vertex, error) {
 	if err != nil {
 		return hex.Vertex{}, err
 	}
-		return hex.Vertex{X: x, Y: yCoord}, nil
+	return hex.Vertex{X: x, Y: yCoord}, nil
 }
 
 func largestKey(m []string) int {

@@ -33,10 +33,10 @@ type GameState struct {
 	AdjacencyGraph1 [][]int  `json:"adjacencyGraph1" gorm:"type:jsonb"`
 	Player2Moves    []Vertex `gorm:"type:jsonb"`
 	AdjacencyGraph2 [][]int  `json:"adjacencyGraph2" gorm:"type:jsonb"`
-    
-    Persister   *GameStatePersister // add this
-	Timer       TimerController
+	Persister *GameStatePersister
+	Timer     TimerController
 }
+
 type MoveLog struct {
 	ID          uint   `gorm:"primaryKey"`
 	GameID      string `gorm:"type:varchar(100);index"`
@@ -47,53 +47,21 @@ type MoveLog struct {
 	Timestamp   int64 `gorm:"autoCreateTime:milli"`
 }
 
-// Define a struct to represent a locked game with two players
-type LockedGame struct {
-	WorkerID      string
-	GameID        string
-	InitialPlayer PlayerIdentity // until after second turn there won't be a player 1 and 2, because of the swap mechanic
-	SwapPlayer    PlayerIdentity
-	Player1       PlayerIdentity
-	Player2       PlayerIdentity
-}
+// type Worker_old struct {
+// 	WorkerID    string
+// 	GameID      string
+// 	PlayerChan  chan PlayerIdentity
+// 	ReleaseChan chan string // Channel to notify the worker to release the player
+// 	// to initiate a game:
+// 	StartChan chan Command
+// }
 
-// newer draft of workers+ lobby
-type Worker struct {
-	WorkerID string
-	GameChan chan Game //
-
-}
-
-type Lobby struct {
-	Games   chan Game   // this chan will be populated by the matchmaking logic
-	Results chan Result // this chan will be populated by the workers relaying the results of the games
-}
-
-type Worker_old struct {
-	WorkerID    string
-	GameID      string
-	PlayerChan  chan PlayerIdentity
-	ReleaseChan chan string // Channel to notify the worker to release the player
-	// to initiate a game:
-	StartChan chan Command
-}
-
-type Lobby_old struct {
-	PlayerQueue chan PlayerIdentity
-	WorkerQueue chan *Worker
-	PlayerCount int32
-	WorkerCount int32
-}
-
-type Game struct {
-	ID   int
-	Data interface{}
-}
-
-type Result struct {
-	GameID int
-	Result interface{}
-}
+// type Lobby_old struct {
+// 	PlayerQueue chan PlayerIdentity
+// 	WorkerQueue chan *Worker
+// 	PlayerCount int32
+// 	WorkerCount int32
+// }
 
 //.............. PERSISTENCE ....................//
 
@@ -123,13 +91,14 @@ type GameStatePersister struct {
 }
 
 // this struct holds all the dependencies required by other parts of the system. nothing game specific here
-type GameContainer struct {
+type Container struct {
 	ErrorLog    LogController
 	EventCmdLog LogController
 	Persister   *GameStatePersister
 	Exiter      *GracefulExit
 }
 
+// DUPLICATED STRUCT ... ALSO FOUND IN WORKERPOOL
 type PlayerIdentity struct {
 	PlayerID          string
 	CurrentGameID     string
@@ -165,18 +134,11 @@ var CmdTypeMap = map[string]interface{}{
 	"LetsStartTheGameCmd": &LetsStartTheGameCmd{},
 	"PlayerForfeitingCmd": &PlayerForfeitingCmd{},
 	"NextTurnStartingCmd": &NextTurnStartingCmd{},
-	"EndingGameCmd":       &EndingGameCmd{},
 	"SwapTileCmd":         &SwapTileCmd{},
 	"PlayInitialTileCmd":  &PlayInitialTileCmd{},
 }
 
-type EndingGameCmd struct {
-	Command
-	GameID       string `json:"gameId"`
-	WinnerID     string `json:"winnerId"`
-	LoserID      string `json:"loserId"`
-	WinCondition string `json:"moveData"`
-}
+
 
 type NextTurnStartingCmd struct {
 	Command
@@ -246,6 +208,7 @@ var EventTypeMap = map[string]interface{}{
 	"GameStateUpdate":              &GameStateUpdate{},
 	"GameStartEvent":               &GameStartEvent{},
 	"TimerON_StartTurnAnnounceEvt": &TimerON_StartTurnAnnounceEvt{},
+	"GameEndEvent":				    &GameEndEvent{},
 }
 
 type GameAnnouncementEvent struct {
@@ -326,4 +289,13 @@ type SecondTurnPlayed struct {
 	Player1               string `json:"player1"`
 	Player2               string `json:"player2"`
 	Timestamp             string `json:"timestamp"`
+}
+
+type GameEndEvent struct {
+	Event
+	GameID       string `json:"gameId"`
+	WinnerID     string `json:"winnerId"`
+	LoserID      string `json:"loserId"`
+	WinCondition string `json:"moveData"`
+	CombinedMoveLog	     map[int]string `json:"moveLog"`
 }

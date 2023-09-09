@@ -17,10 +17,11 @@ const (
 
 func NewLobby() *Lobby {
 	return &Lobby{
-		games:   make(chan Game, 0),
-		results: make(chan Result, 0),
+		Games:   make(chan Game, 0),
+		Results: make(chan Result, 0),
 	}
 }
+
 func (l *Lobby) Run() {
 	var wg sync.WaitGroup
 
@@ -28,16 +29,16 @@ func (l *Lobby) Run() {
 	for w := 1; w <= initialNumWorkers; w++ {
 		wg.Add(1)
 		go func(workerID int) {
-			worker(workerID, l.games, l.results)
+			worker(workerID, l.Games, l.Results)
 			wg.Done()
 		}(w)
 	}
 
 	numWorkers := initialNumWorkers
-	// Monitor the games channel length
+	// Monitor the Games channel length
 	go func() {
 		for range time.Tick(time.Second) {
-			queueSize := len(l.games)
+			queueSize := len(l.Games)
 			if queueSize > maxQueueSize && numWorkers < maxWorkers {
 				// Increase the number of workers
 				numWorkers++
@@ -46,7 +47,7 @@ func (l *Lobby) Run() {
 				wg.Add(1)
 
 				go func(workerID int) {
-					worker(workerID, l.games, l.results)
+					worker(workerID, l.Games, l.Results)
 					wg.Done()
 				}(numWorkers)
 
@@ -65,39 +66,42 @@ func (l *Lobby) Run() {
 		close(waitForShutdown)
 	}()
 
-	// Collect results
+	// Collect Results
 	go func() {
-		for r := range l.results {
+		for r := range l.Results {
 			fmt.Println("Game", r.GameID, "result:", r.Result)
 		}
 	}()
 
-	// Assign games to workers
+	// Assign Games to workers
 	// This can be populated by your matchmaking logic
 	/*     for j := 1; j <= numGames; j++ {
-	       l.games <- Game{ID: j, Data: j}
+	       l.Games <- Game{ID: j, Data: j}
 	   } */
 
 	// Graceful shutdown
 	<-waitForShutdown
-	close(l.results)
+	close(l.Results)
 	fmt.Println("Worker pool shutdown")
 }
 
 func main() {
 	lobby := NewLobby()
-	lobby.Run()
+	go lobby.Run()
 }
 
-func worker(id int, games <-chan Game, results chan<- Result) {
-	for game := range games {
+func StartWorker(con *hex.Container, id int, Games <-chan Game, Results chan<- Result) {
+	w := new(Worker) // create a new worker
+
+	for game := range Games {
 		fmt.Println("Worker", id, "started game", game.ID)
 
-		// subscribes to a pubsub channel for the game so that it can listen for the game to finish
+		w.runGame(game, con)
 
-		// get results
-		// send results to results channel
-		results <- Result{GameID: game.ID, Result: result}
+		// TODO: Fetch the result from the game execution
+		// result := ...
+		
+		Results <- Result{GameID: game.ID, Result: result}
 	}
 }
 
@@ -111,13 +115,6 @@ func (l *Lobby) RegisterWorker(worker *Worker) {
 
 func InitLobby(numWorkers int) *Lobby {
 	lobby := NewLobby()
-
-	for i := 0; i < numWorkers; i++ {
-		workerID := fmt.Sprintf("worker%02d", i+1)
-		worker := NewWorker(workerID)
-		lobby.RegisterWorker(worker)
-	}
-
 	go lobby.Run()
 	return lobby
 }

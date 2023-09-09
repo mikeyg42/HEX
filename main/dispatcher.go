@@ -13,7 +13,7 @@ import (
 
 // Dispatcher represents the combined event and command dispatcher.
 type Dispatcher struct {
-	Container       *hex.GameContainer
+	Container       *hex.Container
 	commandHandlers map[string]func(interface{})
 	eventHandlers   map[string]func(interface{})
 	CommandChan     chan interface{}
@@ -22,7 +22,7 @@ type Dispatcher struct {
 	StartChan chan hex.Command
 }
 
-func NewDispatcher(ctx context.Context, container *hex.GameContainer) *Dispatcher {
+func NewDispatcher(ctx context.Context, container *hex.Container) *Dispatcher {
 	d := &Dispatcher{
 		CommandChan: make(chan interface{}),
 		EventChan:   make(chan interface{}),

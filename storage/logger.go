@@ -19,7 +19,7 @@ type Logger struct {
 	ZapLogger     *zap.Logger
 	LogLevel      gormlogger.LogLevel
 	SlowThreshold time.Duration
-	ContextFn     ContextFunction
+	ContextFn     func(ctx context.Context) []zapcore.Field
 	mu            sync.Mutex
 }
 
@@ -54,7 +54,7 @@ func InitLogger(logFilePath string, level gormlogger.LogLevel) *Logger {
 		ZapLogger:     logger,
 		LogLevel:      level,
 		SlowThreshold: 100 * time.Millisecond,
-		ContextFn:       nil,
+		ContextFn:     nil,
 		mu:            sync.Mutex{},
 	}
 }
@@ -122,3 +122,9 @@ func (logger *Logger) InfoLog(ctx context.Context, msg string, fields ...zapcore
 
 // e.g. logger.Info(context.Background(), "User %s with id %d logged in.", "alice", 123)
 // OR : logger.InfoLog(context.Background(), "User login", zap.String("user", "alice"), zap.Int("id", 123))
+
+// you need this to mirror of the GORM logger signature
+func (l *Logger) LogMode(level gormlogger.LogLevel) gormlogger.Interface {
+	l.LogLevel = level
+	return l
+}

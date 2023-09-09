@@ -39,7 +39,7 @@ func main() {
 	
 	parentCtx, parentCancelFunc := context.WithCancel(context.Background())
 	
-	con, error := NewGameContainer(parentCtx, parentCancelFunc)
+	con, error := NewContainer(parentCtx, parentCancelFunc)
 	if error != nil {
 		panic(error)
 	}
@@ -61,7 +61,7 @@ func main() {
 //................................................//
 
 
-func (con *hex.GameContainer) GracefullyExiting() {
+func (con *hex.Container) GracefullyExiting() {
 
 	// Close the Redis client = 
 	err := con.Persister.Redis.Client.Close()
@@ -77,8 +77,8 @@ func (con *hex.GameContainer) GracefullyExiting() {
 	sqlDB.Close()
 
 	// flush logger queues I think?
-	con.ErrorLog.ZapLogger.Sync()
-	con.EventCmdLog.ZapLogger.Sync()
+	con.ErrorLog.Sync()
+	con.EventCmdLog.Sync()
 	
 	// cancel the parent context, canceling all children too
 	con.Exiter.ParentCancelFunc()
@@ -88,7 +88,7 @@ func (con *hex.GameContainer) GracefullyExiting() {
 //................................................//
 
 
-func NewGameContainer(ctx context.Context, ctxCancelFunc context.CancelFunc) (*hex.GameContainer, error) {
+func NewContainer(ctx context.Context, ctxCancelFunc context.CancelFunc) (*hex.Container, error) {
 	eventCmdLogger := storage.InitLogger("/Users/mikeglendinning/projects/HEX/eventCommandLog.log", gormlogger.Info)
 	errorLogger := storage.InitLogger("/Users/mikeglendinning/projects/HEX/errorLog.log", gormlogger.Info)
 	
@@ -116,14 +116,11 @@ func NewGameContainer(ctx context.Context, ctxCancelFunc context.CancelFunc) (*h
 	exiter := &hex.GracefulExit{
 		ParentCancelFunc: ctxCancelFunc,
 	}
-
-    timer := MakeNewTimer()
         
-    return &hex.GameContainer{
+    return &hex.Container{
 		Persister: 	 gsp,
         ErrorLog:    errorLogger,
 		EventCmdLog: eventCmdLogger,
-        Timer:       timer,
 		Exiter: 	 exiter,
     }, nil
 }

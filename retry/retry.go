@@ -12,6 +12,8 @@ import (
 
 const maxRetries = 3
 
+// last output of the function to be retried MUST be an error. and the function MUST return no more than 3 outputs (error included)
+
 // RResult represents the result of a function execution, encapsulating any error that occurred and a message.
 type RResult struct {
 	Err       error
@@ -54,7 +56,7 @@ func RetryFunc(ctx context.Context, function interface{}) *RResult {
 			return retryWithResultAndError(ctx, function.(func() (string, error)))
 		}
 	case 3:
-		// Here we are assuming the three return types are string, int, and error
+		// Here we are assuming the three return types are string, interface, and error
 		if isErrorType(typ.Out(2)) {
 			return retryWithThree(ctx, function.(func() (string, interface{}, error)))
 		}
@@ -92,7 +94,7 @@ func retryWithError(ctx context.Context, function func() error) *RResult {
 }
 
 func retryWithResultAndError(ctx context.Context, function func() (string, error)) *RResult {
-	logger := getLoggerFromContext(ctx)
+	logger := GetLoggerFromContext(ctx)
 	for i := 0; i < maxRetries; i++ {
 		msg, err := function()
 		if err == nil {
@@ -113,7 +115,9 @@ func retryWithResultAndError(ctx context.Context, function func() (string, error
 }
 
 func retryWithThree(ctx context.Context, function func() (string, interface{}, error)) *RResult {
-	logger := getLoggerFromContext(ctx)
+
+	logger := GetLoggerFromContext(ctx)
+
 	for i := 0; i < maxRetries; i++ {
 		msg, intface, err := function()
 		if err == nil {
@@ -132,6 +136,8 @@ func retryWithThree(ctx context.Context, function func() (string, interface{}, e
 	logger.Error("Failed after all retries")
 	return &RResult{Err: fmt.Errorf("failed after %d attempts", maxRetries), Message: "Failure after retries", Interface: nil}
 }
+
+// helper function to check if an output of the function is an error
 func isErrorType(t reflect.Type) bool {
 	return t == reflect.TypeOf((*error)(nil)).Elem()
 }

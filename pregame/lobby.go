@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/mikeyg42/HEX/models"
+	hex "github.com/mikeyg42/HEX/models"
 )
 
 const (
@@ -115,6 +115,6 @@ func (l *Lobby) RegisterWorker(worker *Worker) {
 
 func InitLobby(numWorkers int) *Lobby {
 	lobby := NewLobby()
-	go lobby.Run()
+ 	go lobby.Run()
 	return lobby
 }

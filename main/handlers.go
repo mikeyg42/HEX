@@ -27,7 +27,7 @@ func (d *Dispatcher) handleCommandWrapper(cmd interface{}) {
 }
 
 // Event Handler
-func (d *Dispatcher) handleEvent(done <-chan struct{}, event hex.Event, eventPubSub *redis.PubSub) error {
+func (d *Dispatcher) handleEvent(done <-chan struct{}, event hex.Eventer, eventPubSub *redis.PubSub) error {
 	con := d.Container
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -42,7 +42,7 @@ func (d *Dispatcher) handleEvent(done <-chan struct{}, event hex.Event, eventPub
 		con.EventCmdLog.InfoLog(ctx, strings.Join(strs, "/"))
 
 		// To get here means the player's move was valid! Therefore, we can stop their countdown. we will start new one after processing this move
-		timer.StopTimer()
+		d.Timer.StopTimer()
 
 		// This will parse the new move and then publish another message to the event bus that will be picked up by persisting logic and the win condition logic
 		newEvt := Handler_OfficialMoveEvt(ctx, event, con)
@@ -54,7 +54,7 @@ func (d *Dispatcher) handleEvent(done <-chan struct{}, event hex.Event, eventPub
 
 		d.CommandDispatcher(newCmd)
 
-		con.Timer.StopTimer() //always do this before starting timer again to ensure that the timer is flushed. It doesnt hurt to stop repeatedly.
+		d.Timer.StopTimer() //always do this before starting timer again to ensure that the timer is flushed. It doesnt hurt to stop repeatedly.
 
 	default:
 		con.ErrorLog.Error(ctx, "unknown event type: %v", fmt.Errorf("weird event type: %v", event))
@@ -63,7 +63,7 @@ func (d *Dispatcher) handleEvent(done <-chan struct{}, event hex.Event, eventPub
 	return nil
 }
 
-func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd hex.Command, commandPubSub *redis.PubSub) {
+func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd hex.Commander, commandPubSub *redis.PubSub) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -81,7 +81,6 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd hex.Command, comman
 				GameID:    cmd.GameID,
 				PlayerID:  cmd.SourcePlayerID,
 				MoveData:  cmd.DeclaredMove,
-				Timestamp: time.Now(),
 			}
 			con.Timer.StopTimer()
 			d.EventDispatcher(newEvent)
@@ -159,7 +158,6 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd hex.Command, comman
 			GameID:    cmd.GameID,
 			PlayerID:  cmd.SourcePlayerID,
 			MoveData:  cmd.DeclaredMove,
-			Timestamp: time.Now(),
 		}
 
 		d.EventDispatcher(newEvent)
@@ -169,25 +167,25 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd hex.Command, comman
 		con.EventCmdLog.InfoLog(ctx, fmt.Sprintf("NextTurnStartingCmd received for game : %s", cmd.GameID0))
 
 		// Only Place you start the timer!
-		GameState.Timer.StartTimer()
+		d.Timer.StartTimer()
 
 		startTime := time.Now()
-		gs.Persister                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      = startTime.Add(moveTimeout)
+		d.Container.Persister                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      = startTime.Add(moveTimeout)
 
-		newEvt := &TimerON_StartTurnAnnounceEvt{
+		newEvt := &hex.TimerON_StartTurnAnnounceEvt{
 			GameID:         cmd.GameID,
 			ActivePlayerID: cmd.NextPlayerID,
 			TurnStartTime:  startTime,
-			TurnEndTime:    endTime,
+			TurnEndTime:    cmd.TimeStamp,//????
 			MoveNumber:     cmd.UpcomingMoveNumber,
 		}
 		d.EventDispatcher(newEvt)
 
 	case *hex.PlayerForfeitingCmd:
 
-		con.EventCmdLog.Info(ctx, "Player forfeited the game", zap.String("PlayerID", cmd.SourcePlayerID), zap.String("GameID", cmd.GameID), zap.String("ForfeitReason", cmd.Reason))
+		con.EventCmdLog.InfoLog(ctx, "Player forfeited the game", zap.String("PlayerID", cmd.SourcePlayerID), zap.String("GameID", cmd.GameID), zap.String("ForfeitReason", cmd.Reason))
 
-		con.Timer.StopTimer()
+		d.Timer.StopTimer()
 
 		// Determine who the winner is via the allLockedGames struct
 		lg := allLockedGames[cmd.GameID]
@@ -217,19 +215,11 @@ func (d *Dispatcher) handleCommand(done <-chan struct{}, cmd hex.Command, comman
 
 	case *hex.LetsStartTheGameCmd: // this command is generated by the LockTheGame function found in the workerpool code
 
-		// Create a new channel for this game instance
+	
 		gameID := cmd.GameID
 
-		// Check if the game is still locked (not claimed by another goroutine)
-		lockMutex.Lock()
-		lockedGame, ok := allLockedGames[gameID]
-		delete(allLockedGames, gameID) // Remove the game from the map
-		lockMutex.Unlock()
-
-		if !ok {
-			// The game was claimed by another goroutine, abort this instance
-			return
-		}
+	// Check if the game is not claimed by another goroutine!!!! Use LockMutex!!
+	// dont skip this!!!~
 
 		// Announce the game with the locked players in a new goroutine
 		startEvent := &GameStartEvent{

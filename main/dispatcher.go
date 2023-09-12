@@ -20,6 +20,8 @@ type Dispatcher struct {
 	EventChan       chan interface{}
 	// to initiate a game:
 	StartChan chan hex.Command
+	// to give handlers access to timer:
+	Timer hex.TimerController
 }
 
 func NewDispatcher(ctx context.Context, container *hex.Container) *Dispatcher {

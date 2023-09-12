@@ -9,7 +9,27 @@ import (
 	zapcore "go.uber.org/zap/zapcore"
 	_ "gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"sync"
 )
+
+// Define a struct to represent a locked game with two players
+type LockedGame struct {
+	WorkerID      string
+	GameID        string
+	InitialPlayer PlayerIdentity // until after second turn there won't be a player 1 and 2, because of the swap mechanic
+	SwapPlayer    PlayerIdentity
+	Player1       PlayerIdentity
+	Player2       PlayerIdentity
+}
+
+var (
+	AllLockedGames = make(map[string]LockedGame) // the key is the gameID, the value is the whole locked game struct
+	LockMutex      = sync.Mutex{}
+)
+
+type GameStateControllerInterface interface {
+    RecreateGS_Postgres(ctx context.Context, playerID, gameID string, moveCounter int) ([][]int, []Vertex, error)
+}
 
 type TimerController interface {
 	StopTimer()
@@ -33,8 +53,8 @@ type GameState struct {
 	AdjacencyGraph1 [][]int  `json:"adjacencyGraph1" gorm:"type:jsonb"`
 	Player2Moves    []Vertex `gorm:"type:jsonb"`
 	AdjacencyGraph2 [][]int  `json:"adjacencyGraph2" gorm:"type:jsonb"`
-	Persister *GameStatePersister
-	Timer     TimerController
+	Persister       *GameStatePersister
+	Timer           TimerController
 }
 
 type MoveLog struct {
@@ -119,16 +139,6 @@ type GracefulExit struct {
 	ParentCancelFunc context.CancelFunc
 }
 
-// ................ commands ......................//
-type Event interface {
-	// ModifyPersistedDataTable will be used by events to persist data to the database.
-	MarshalEvt() ([]byte, error)
-}
-
-type Command interface {
-	MarshalCmd() ([]byte, error)
-}
-
 var CmdTypeMap = map[string]interface{}{
 	"DeclaringMoveCmd":    &DeclaringMoveCmd{},
 	"LetsStartTheGameCmd": &LetsStartTheGameCmd{},
@@ -138,48 +148,41 @@ var CmdTypeMap = map[string]interface{}{
 	"PlayInitialTileCmd":  &PlayInitialTileCmd{},
 }
 
-
-
 type NextTurnStartingCmd struct {
 	Command
 	GameID             string
 	PriorPlayerID      string
 	NextPlayerID       string
 	UpcomingMoveNumber int
-	TimeStamp          time.Time
 }
 
 type DeclaringMoveCmd struct {
 	Command
-	GameID         string    `json:"gameId"`
-	SourcePlayerID string    `json:"playerId"`
-	DeclaredMove   string    `json:"moveData"`
-	Timestamp      time.Time `json:"timestamp"`
+	GameID         string `json:"gameId"`
+	SourcePlayerID string `json:"playerId"`
+	DeclaredMove   string `json:"moveData"`
 }
 
 type CheckForWinConditionCmd struct {
 	Command
-	GameID    string    `json:"gameId"`
-	MoveCount int       `json:"moveCount"`
-	PlayerID  string    `json:"playerId"`
-	Timestamp time.Time `json:"timestamp"`
+	GameID    string `json:"gameId"`
+	MoveCount int    `json:"moveCount"`
+	PlayerID  string `json:"playerId"`
 }
 
 type LetsStartTheGameCmd struct {
 	Command
-	GameID          string    `json:"gameId"`
-	NextMoveNumber  int       `json:"nextMoveNumber"`
-	InitialPlayerID string    `json:"initialPlayerId"`
-	SwapPlayerID    string    `json:"swapPlayerId"`
-	Timestamp       time.Time `json:"timestamp"`
+	GameID          string `json:"gameId"`
+	NextMoveNumber  int    `json:"nextMoveNumber"`
+	InitialPlayerID string `json:"initialPlayerId"`
+	SwapPlayerID    string `json:"swapPlayerId"`
 }
 
 type PlayerForfeitingCmd struct {
 	Command
-	GameID         string    `json:"gameId"`
-	SourcePlayerID string    `json:"playerId"`
-	Timestamp      time.Time `json:"timestamp"`
-	Reason         string    `json:"reason"`
+	GameID         string `json:"gameId"`
+	SourcePlayerID string `json:"playerId"`
+	Reason         string `json:"reason"`
 }
 
 type PlayInitialTileCmd struct {
@@ -208,23 +211,21 @@ var EventTypeMap = map[string]interface{}{
 	"GameStateUpdate":              &GameStateUpdate{},
 	"GameStartEvent":               &GameStartEvent{},
 	"TimerON_StartTurnAnnounceEvt": &TimerON_StartTurnAnnounceEvt{},
-	"GameEndEvent":				    &GameEndEvent{},
+	"GameEndEvent":                 &GameEndEvent{},
 }
 
+// this event will originate from the matchmaking service and is sent in the GameChan of the lobby and worker
 type GameAnnouncementEvent struct {
 	Event
-	GameID         string    `json:"gameId"`
-	FirstPlayerID  string    `json:"firstplayerID"`
-	SecondPlayerID string    `json:"secondplayerID"`
-	Timestamp      time.Time `json:"timestamp"`
+	PlayerA_ID  string `json:"firstplayerID"`
+	PlayerB_ID string `json:"secondplayerID"`
 }
 
 type DeclaredMoveEvent struct {
 	Event
-	GameID    string    `json:"gameId"`
-	PlayerID  string    `json:"playerId"`
-	MoveData  string    `json:"moveData"`
-	Timestamp time.Time `json:"timestamp"`
+	GameID   string `json:"gameId"`
+	PlayerID string `json:"playerId"`
+	MoveData string `json:"moveData"`
 }
 
 type InvalidMoveEvent struct {
@@ -239,7 +240,6 @@ type GameStartEvent struct {
 	GameID         string
 	FirstPlayerID  string
 	SecondPlayerID string
-	Timestamp      time.Time
 }
 
 type TimerON_StartTurnAnnounceEvt struct {
@@ -253,10 +253,9 @@ type TimerON_StartTurnAnnounceEvt struct {
 
 type OfficialMoveEvent struct {
 	Event
-	GameID    string    `json:"gameId"`
-	PlayerID  string    `json:"playerId"`
-	MoveData  string    `json:"moveData"`
-	Timestamp time.Time `json:"timestamp"`
+	GameID   string `json:"gameId"`
+	PlayerID string `json:"playerId"`
+	MoveData string `json:"moveData"`
 }
 
 type GameStateUpdate struct {
@@ -272,11 +271,10 @@ type GameStateUpdate struct {
 
 type InitialTilePlayed struct {
 	Event
-	GameID                string    `json:"gameId"`
-	InitialPlayerID       string    `json:"initialplayerId"`
-	SwapPlayerID          string    `json:"swapplayerId"`
-	InitialTileCoordinate string    `json:"initialtilecoordinate"`
-	Timestamp             time.Time `json:"timestamp"`
+	GameID                string `json:"gameId"`
+	InitialPlayerID       string `json:"initialplayerId"`
+	SwapPlayerID          string `json:"swapplayerId"`
+	InitialTileCoordinate string `json:"initialtilecoordinate"`
 }
 
 type SecondTurnPlayed struct {
@@ -288,14 +286,13 @@ type SecondTurnPlayed struct {
 	SecondTileCoordinate  string `json:"secondtilecoordinate"`
 	Player1               string `json:"player1"`
 	Player2               string `json:"player2"`
-	Timestamp             string `json:"timestamp"`
 }
 
 type GameEndEvent struct {
 	Event
-	GameID       string `json:"gameId"`
-	WinnerID     string `json:"winnerId"`
-	LoserID      string `json:"loserId"`
-	WinCondition string `json:"moveData"`
-	CombinedMoveLog	     map[int]string `json:"moveLog"`
+	GameID          string         `json:"gameId"`
+	WinnerID        string         `json:"winnerId"`
+	LoserID         string         `json:"loserId"`
+	WinCondition    string         `json:"moveData"`
+	CombinedMoveLog map[int]string `json:"moveLog"`
 }

@@ -3,7 +3,6 @@ package pregame
 import (
 	"context"
 	"fmt"
-	"sync"
 	"encoding/json"
 	"strings"
 
@@ -12,6 +11,8 @@ import (
 	retry "github.com/mikeyg42/HEX/retry"
 	logger "github.com/mikeyg42/HEX/storage"
 	timer "github.com/mikeyg42/HEX/timerpkg"
+	zap "go.uber.org/zap"
+	storage "github.com/mikeyg42/HEX/storage"
 )
 
 type PlayerIdentity struct {
@@ -24,8 +25,8 @@ type PlayerIdentity struct {
 
 type Worker struct {
 	WorkerID string
-	GameChan chan Game //
-	Results  chan Result
+	GameChan chan hex.GameAnnouncementEvent 
+	ResultsChan  chan hex.GameEndEvent
 }
 
 type Game struct {
@@ -35,37 +36,16 @@ type Game struct {
 	Id_PlayerB PlayerIdentity
 }
 
-type Result struct {
-	GameID int
-	Result interface{}
-}
-
 type Lobby struct {
-	Games   chan Game   // this chan will be populated by the matchmaking logic
-	Results chan Result // this chan will be populated by the workers relaying the results of the games
+	GameChan       chan hex.GameAnnouncementEvent   // this chan will be populated by the matchmaking logic
+	ResultsChan    chan hex.GameEndEvent // this chan will be populated by the workers relaying the results of the games
 }
 
-// Define a struct to represent a locked game with two players
-type LockedGame struct {
-	WorkerID      string
-	GameID        string
-	InitialPlayer PlayerIdentity // until after second turn there won't be a player 1 and 2, because of the swap mechanic
-	SwapPlayer    PlayerIdentity
-	Player1       PlayerIdentity
-	Player2       PlayerIdentity
-}
 
-// Define a shared map to keep track of locked games
-var (
-	allLockedGames = make(map[string]LockedGame)
-	lockMutex      = sync.Mutex{}
 
-	acknowledgments = make(map[string][]string)
-	ackMutex        = sync.Mutex{}
-)
 
 type GameController struct {
-	Worker    string
+	WorkerID    string
 	MsgChan   chan interface{}
 	Persister *hex.GameStatePersister
 	Errlog    *logger.Logger
@@ -112,12 +92,8 @@ func (w *Worker) NewGameController(playerA, playerB string, con *hex.Container) 
 		panic(retryResult.Err)
 	}
 	
-	return 	w.InitializeGS(con, gameID, playerA, playerB)
-}
-
-func (w *Worker) InitializeGS(con *hex.Container, gameID string, playerA, playerB string) *GameController {
 	return &GameController{
-		Worker:    w.WorkerID,
+		WorkerID:    w.WorkerID,
 		Persister: con.Persister,
 		Errlog:    con.ErrorLog.(*logger.Logger),
 		GameID:    gameID,
@@ -127,14 +103,30 @@ func (w *Worker) InitializeGS(con *hex.Container, gameID string, playerA, player
 	}
 }
 
+
 func (w *Worker) runGame(game Game, con *hex.Container) {
 
 	gc := w.NewGameController(game.Id_PlayerA.PlayerID, game.Id_PlayerB.PlayerID, con)
 
 	ctx := context.Background()
-	eventPubSub := gc.Persister.Redis.Client.Subscribe(ctx, "events")
+	eventPubSub := gc.Persister.Redis.Client.Subscribe(ctx, "endEvent")
 	defer eventPubSub.Close()
 
+	// Publish the game announcement event
+	msg := &hex.LetsStartTheGameCmd{
+	GameID: gc.GameID,
+	NextMoveNumber: 1,
+	InitialPlayerID: gc.Id_PlayerA,
+	SwapPlayerID: gc.Id_PlayerB,
+	}
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		// retry?? or just log and kms?
+	}
+
+	gc.Persister.Redis.Client.Publish(ctx, "Command", payload).Err()
+	
+	// after the game is started, we just need to wait for the game to end
 	msgChan := eventPubSub.Channel()
 	
 	for {
@@ -143,35 +135,47 @@ func (w *Worker) runGame(game Game, con *hex.Container) {
 			// First, do a quick check if the message contains the expected event type
 			if strings.Contains(msg.Payload, `"eventType:GameEndEvent"`) && strings.Contains(msg.Payload, fmt.Sprintf(`"gameID":"%s"`, gc.GameID)) {
 				// fully unmarshal and process the message
-				var eventMessage struct {
-					GameID    string `json:"gameID"`
-					EventType string `json:"eventType"`
-					Data      map[string]hex.GameEndEvent `json:"data"`
-				}
-				err := json.Unmarshal([]byte(msg.Payload), &eventMessage)
+				var evtMessage hex.GameEndEvent
+				err := json.Unmarshal([]byte(msg.Payload),evtMessage)
 				if err != nil {
 					// Handle error
 					continue
 				}
 	
 				// Check if this message is for this worker and is of type "GameEndEvent"
-				if eventMessage.GameID == gc.GameID && eventMessage.EventType == "GameEndEvent" {
+				if evtMessage.GameID == gc.GameID {
 					continue
 				}
 
-				results := eventMessage.Data[gc.GameID]
+				// Tells the lobby that the game has ended
+				w.ResultsChan <- evtMessage
 
-				moveLog :=results.CombinedMoveLog
-				winner := results.WinnerID
-				loser := results.LoserID
-				winCondition := results.WinCondition
+				// ensure that the game has been all persisted to Postgres somehow?
 
+				// clear all this games data from the Redis Cache
 
-				// Handle the GameEndingEvent for this game instance
-				Results <- Result{GameID: game.ID, Result: result}
+				// Remove the game from the locked games map
+				hex.LockMutex.Lock()
+				delete(hex.AllLockedGames, gc.GameID)
+				hex.LockMutex.Unlock()
 			}
 			
 		case <-ctx.Done():
+			gc.Errlog.ErrorLog(ctx, "Context cancelled", zap.Bool("game complete?", false), zap.Error(ctx.Err()), zap.String("gameID", gc.GameID))
+			
+			moveList, err := storage.FetchMoveListFromCache(ctx, gc.GameID, con)
+			if err !=nil {
+				gc.Errlog.ErrorLog(ctx, "Game interrupted, but unable to fetch move list from cache", zap.Bool("game complete?", false), zap.String("gameID", gc.GameID))
+				
+			}
+			// save the move list to the logger as a last ditch effort to persist game before closing
+			gc.Errlog.InfoLog(ctx, "Game interrupted, saved move list from cache", zap.Bool("game complete?", true), zap.String("gameID", gc.GameID), zap.ObjectValues("moveList", moveList))
+
+			// remove the game fro the locked games map
+			hex.LockMutex.Lock()
+			delete(hex.AllLockedGames, gc.GameID)
+			hex.LockMutex.Unlock()
+
 			return
 		}
 	}

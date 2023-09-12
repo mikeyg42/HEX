@@ -12,20 +12,28 @@ import (
 	ti "github.com/mikeyg42/HEX/timerpkg"
 	zap "go.uber.org/zap"
 	gormlogger "gorm.io/gorm/logger"
-
 )
 
 const SideLenGameboard = 15
 const maxRetries = 3
 
-type GameState struct {
+type GameStateController struct {
 	Persister *hex.GameStatePersister
 	Errlong   *storage.Logger
 	GameID    string
-	Timer     ti.TimerControl
+	Timer     *ti.TimerControl
 }
 
-func (gs *GameState) HandleGameStateUpdate(newMove *hex.GameStateUpdate) interface{} {
+func NewGameStateController(p *hex.GameStatePersister, errlog *storage.Logger, gameID string, timer ti.TimerControl) GameStateControllerInterface {
+    return &GameStateController{
+        Persister: p,
+        Errlong:   errlog,
+        GameID:    gameID,
+        Timer:     ti.MakeNewTimer(),
+    }
+}
+
+func (gs *GameStateController) HandleGameStateUpdate(newMove *hex.GameStateUpdate) interface{} {
 	pg := gs.Persister.Postgres
 	rs := gs.Persister.Redis
 
@@ -104,7 +112,8 @@ func (gs *GameState) HandleGameStateUpdate(newMove *hex.GameStateUpdate) interfa
 		newEvt := &hex.GameEndEvent{
 			GameID:       gameID,
 			WinnerID:     playerID,
-			LoserID:      loserID,
+			LoserID:      los
+
 			WinCondition: "A True Win",
 		}
 		return newEvt
@@ -120,7 +129,6 @@ func (gs *GameState) HandleGameStateUpdate(newMove *hex.GameStateUpdate) interfa
 			PriorPlayerID:      playerID,
 			NextPlayerID:       nextPlayer,
 			UpcomingMoveNumber: moveCounter + 1,
-			TimeStamp:          time.Now(),
 		}
 		return newCmd
 	}
@@ -128,53 +136,7 @@ func (gs *GameState) HandleGameStateUpdate(newMove *hex.GameStateUpdate) interfa
 	// include a check to compare redis and postgres?
 }
 
-type RResult struct {
-	Err     error
-	Message string
-}
-
-type FuncWithErrorOnly func() error
-type FuncWithResultAndError func() *RResult
-
-func (gs *GameState) RetryFunc(ctx context.Context, function interface{}) *RResult {
-	var msg string = ""
-	var lastErr error = nil
-
-	for i := 0; i < maxRetries; i++ {
-	
-		switch f := function.(type) {
-		case FuncWithErrorOnly:
-			lastErr = f()
-
-		case FuncWithResultAndError:
-			result := f()
-			lastErr = result.Err
-			msg = result.Message
-
-			if lastErr == nil {
-				gs.Errlong.InfoLog(ctx, "RetryFunc SUCCESS", zap.Int("RetryFunc iteration num", i))
-				return &RResult{
-					Err:     lastErr,
-					Message: msg,
-				}
-			}
-		}
-
-		gs.Errlong.InfoLog(ctx, fmt.Sprintf("Attempt %d failed with error: %v. Retrying...\n", i+1, lastErr), zap.Int("RetryFunc iteration num", i))
-		// Introduce a delay with exponential backoff
-
-		time.Sleep(time.Millisecond * 100 * time.Duration(1<<i))
-
-	}
-	err := fmt.Errorf("failed after %d attempts. Last error: %v", maxRetries, lastErr)
-
-	return &RResult{
-		Err:     err,
-		Message: msg,
-	}
-}
-
-func (gs *GameState) RecreateGS_Postgres(ctx context.Context, playerID, gameID string, moveCounter int) ([][]int, []hex.Vertex, error) {
+func (gs *GameStateController) RecreateGS_Postgres(ctx context.Context, playerID, gameID string, moveCounter int) ([][]int, []hex.Vertex, error) {
 
 	// this function assumes that you have NOT yet incorporated the newest move into this postgres. but moveCounter input is that of the new move yet to be added
 	adjGraph := [][]int{{0, 0}, {0, 0}}
@@ -220,6 +182,7 @@ func (gs *GameState) RecreateGS_Postgres(ctx context.Context, playerID, gameID s
 
 	return adjGraph, moveList, nil
 }
+
 
 // ..... CHECKING FOR WIN CONDITION
 

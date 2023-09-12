@@ -7,6 +7,7 @@ import (
 	"reflect"
 
 	hex "github.com/mikeyg42/HEX/models"
+	pubsub "github.com/mikeyg42/HEX/pubsub"
 	storage "github.com/mikeyg42/HEX/storage"
 	zap "go.uber.org/zap"
 )
@@ -19,7 +20,7 @@ type Dispatcher struct {
 	CommandChan     chan interface{}
 	EventChan       chan interface{}
 	// to initiate a game:
-	StartChan chan hex.Command
+	StartChan chan pubsub.Command
 	// to give handlers access to timer:
 	Timer hex.TimerController
 }
@@ -29,7 +30,7 @@ func NewDispatcher(ctx context.Context, container *hex.Container) *Dispatcher {
 		CommandChan: make(chan interface{}),
 		EventChan:   make(chan interface{}),
 		Container:   container,
-		StartChan:   make(chan hex.Command),
+		StartChan:   make(chan pubsub.Command),
 	}
 
 	//  the DONE chan controls the Dispatcher!
@@ -140,7 +141,7 @@ func (d *Dispatcher) subscribeToCommands(done <-chan struct{}, errChan chan<- er
 					continue
 				}
 				// Type assertion to ensure that the unmarshaled event implements the Command interface
-				cmdTypeAsserted, ok := cmdValue.(hex.Command)
+				cmdTypeAsserted, ok := cmdValue.(pubsub.Commander)
 				if !ok {
 					err := fmt.Errorf("unmarshaled command does not implement Event interface")
 					d.Container.ErrorLog.InfoLog(ctx, err.Error(), zap.Error(err))
@@ -155,14 +156,17 @@ func (d *Dispatcher) subscribeToCommands(done <-chan struct{}, errChan chan<- er
 
 // subscribeToEvents with error channel
 func (d *Dispatcher) subscribeToEvents(done <-chan struct{}, errChan chan<- error) {
+	// use a cancelable context that will end when the goroutine ends automatically (or earlier)
 	ctx, cancelFunc := context.WithCancel(context.Background())
+
+	// subscribe to the events channel (not the same as recieving though!)
 	eventPubSub := d.Container.Persister.Redis.Client.Subscribe(ctx, "events")
 	defer eventPubSub.Close()
 	defer cancelFunc()
 
 	// Event handler
 	go func() {
-		eventCh := eventPubSub.Channel()
+		eventCh := eventPubSub.Channel() // setting up this channel allows you to actually receive what you've subscribed to
 		for {
 			select {
 			case <-done:
@@ -187,7 +191,7 @@ func (d *Dispatcher) subscribeToEvents(done <-chan struct{}, errChan chan<- erro
 				}
 
 				// Type assertion to ensure that the unmarshaled event implements the Event interface
-				evtTypeAsserted, ok := eventValue.(hex.Event)
+				evtTypeAsserted, ok := eventValue.(pubsub.Eventer)
 				if !ok {
 					err := fmt.Errorf("unmarshaled event does not implement Event interface")
 					d.Container.ErrorLog.InfoLog(ctx, err.Error(), zap.Error(nil))

@@ -4,12 +4,14 @@ import (
 	"context"
 	"time"
 
+	"sync"
+
 	cache "github.com/go-redis/cache/v9"
+	pubsub "github.com/mikeyg42/HEX/pubsub"
 	redis "github.com/redis/go-redis/v9"
 	zapcore "go.uber.org/zap/zapcore"
 	_ "gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"sync"
 )
 
 // Define a struct to represent a locked game with two players
@@ -28,7 +30,7 @@ var (
 )
 
 type GameStateControllerInterface interface {
-    RecreateGS_Postgres(ctx context.Context, playerID, gameID string, moveCounter int) ([][]int, []Vertex, error)
+	RecreateGS_Postgres(ctx context.Context, playerID, gameID string, moveCounter int) ([][]int, []Vertex, error)
 }
 
 type TimerController interface {
@@ -39,6 +41,7 @@ type TimerController interface {
 type LogController interface {
 	ErrorLog(ctx context.Context, msg string, fields ...zapcore.Field)
 	InfoLog(ctx context.Context, msg string, fields ...zapcore.Field)
+	Sync()
 }
 
 type Vertex struct {
@@ -115,7 +118,10 @@ type Container struct {
 	ErrorLog    LogController
 	EventCmdLog LogController
 	Persister   *GameStatePersister
-	Exiter      *GracefulExit
+	CtxExiterFn *ContextMaster_exiter
+}
+type ContextMaster_exiter struct {
+	ParentCancelFunc context.CancelFunc	
 }
 
 // DUPLICATED STRUCT ... ALSO FOUND IN WORKERPOOL
@@ -135,9 +141,7 @@ type ErrorLoggerKey struct{}
 type ContextFn func(ctx context.Context) []zapcore.Field
 
 // .................. EXIT ........................//
-type GracefulExit struct {
-	ParentCancelFunc context.CancelFunc
-}
+
 
 var CmdTypeMap = map[string]interface{}{
 	"DeclaringMoveCmd":    &DeclaringMoveCmd{},
@@ -149,7 +153,7 @@ var CmdTypeMap = map[string]interface{}{
 }
 
 type NextTurnStartingCmd struct {
-	Command
+	pubsub.Command
 	GameID             string
 	PriorPlayerID      string
 	NextPlayerID       string
@@ -157,21 +161,21 @@ type NextTurnStartingCmd struct {
 }
 
 type DeclaringMoveCmd struct {
-	Command
+	pubsub.Command
 	GameID         string `json:"gameId"`
 	SourcePlayerID string `json:"playerId"`
 	DeclaredMove   string `json:"moveData"`
 }
 
 type CheckForWinConditionCmd struct {
-	Command
+	pubsub.Command
 	GameID    string `json:"gameId"`
 	MoveCount int    `json:"moveCount"`
 	PlayerID  string `json:"playerId"`
 }
 
 type LetsStartTheGameCmd struct {
-	Command
+	pubsub.Command
 	GameID          string `json:"gameId"`
 	NextMoveNumber  int    `json:"nextMoveNumber"`
 	InitialPlayerID string `json:"initialPlayerId"`
@@ -179,14 +183,14 @@ type LetsStartTheGameCmd struct {
 }
 
 type PlayerForfeitingCmd struct {
-	Command
+	pubsub.Command
 	GameID         string `json:"gameId"`
 	SourcePlayerID string `json:"playerId"`
 	Reason         string `json:"reason"`
 }
 
 type PlayInitialTileCmd struct {
-	Command
+	pubsub.Command
 	GameID          string `json:"gameId"`
 	InitialPlayerID string `json:"initialplayerId"`
 	SwapPlayerID    string `json:"swapplayerId"`
@@ -194,7 +198,7 @@ type PlayInitialTileCmd struct {
 }
 
 type SwapTileCmd struct {
-	Command
+	pubsub.Command
 	GameID                string `json:"gameId"`
 	InitialPlayerID       string `json:"initialplayerId"`
 	SwapPlayerID          string `json:"swapplayerId"`
@@ -216,34 +220,34 @@ var EventTypeMap = map[string]interface{}{
 
 // this event will originate from the matchmaking service and is sent in the GameChan of the lobby and worker
 type GameAnnouncementEvent struct {
-	Event
-	PlayerA_ID  string `json:"firstplayerID"`
+	pubsub.Event
+	PlayerA_ID string `json:"firstplayerID"`
 	PlayerB_ID string `json:"secondplayerID"`
 }
 
 type DeclaredMoveEvent struct {
-	Event
+	pubsub.Event
 	GameID   string `json:"gameId"`
 	PlayerID string `json:"playerId"`
 	MoveData string `json:"moveData"`
 }
 
 type InvalidMoveEvent struct {
-	Event
+	pubsub.Event
 	GameID      string `json:"gameId"`
 	PlayerID    string `json:"playerId"`
 	InvalidMove string `json:"moveData"`
 }
 
 type GameStartEvent struct {
-	Event
+	pubsub.Event
 	GameID         string
 	FirstPlayerID  string
 	SecondPlayerID string
 }
 
 type TimerON_StartTurnAnnounceEvt struct {
-	Event
+	pubsub.Event
 	GameID         string
 	ActivePlayerID string
 	TurnStartTime  time.Time
@@ -252,7 +256,7 @@ type TimerON_StartTurnAnnounceEvt struct {
 }
 
 type OfficialMoveEvent struct {
-	Event
+	pubsub.Event
 	GameID   string `json:"gameId"`
 	PlayerID string `json:"playerId"`
 	MoveData string `json:"moveData"`
@@ -260,7 +264,7 @@ type OfficialMoveEvent struct {
 
 type GameStateUpdate struct {
 	gorm.Model       `redis:"-"`
-	Event            `redis:"-"`
+	pubsub.Event     `redis:"-"`
 	GameID           string
 	MoveCounter      int
 	PlayerID         string
@@ -270,7 +274,7 @@ type GameStateUpdate struct {
 }
 
 type InitialTilePlayed struct {
-	Event
+	pubsub.Event
 	GameID                string `json:"gameId"`
 	InitialPlayerID       string `json:"initialplayerId"`
 	SwapPlayerID          string `json:"swapplayerId"`
@@ -278,7 +282,7 @@ type InitialTilePlayed struct {
 }
 
 type SecondTurnPlayed struct {
-	Event
+	pubsub.Event
 	GameID                string `json:"gameId"`
 	InitialPlayerID       string `json:"initialplayerId"`
 	SwapPlayerID          string `json:"swapplayerId"`
@@ -289,7 +293,7 @@ type SecondTurnPlayed struct {
 }
 
 type GameEndEvent struct {
-	Event
+	pubsub.Event
 	GameID          string         `json:"gameId"`
 	WinnerID        string         `json:"winnerId"`
 	LoserID         string         `json:"loserId"`

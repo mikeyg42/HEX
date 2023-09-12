@@ -128,3 +128,8 @@ func (l *Logger) LogMode(level gormlogger.LogLevel) gormlogger.Interface {
 	l.LogLevel = level
 	return l
 }
+
+func (logger *Logger) Sync() {
+	logger.ZapLogger.Sync()
+	return
+}

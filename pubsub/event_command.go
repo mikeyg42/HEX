@@ -1,4 +1,4 @@
-package models
+package pubsub
 
 import (
 	"time"
@@ -16,9 +16,9 @@ type Event struct {
 }
 
 type Eventer interface {
-    MetaData() MetaData
-    Timestamp() time.Time
-    AddMetaData(key string, value interface{})
+	MetaData() MetaData
+	Timestamp() time.Time
+	AddMetaData(key string, value interface{})
 }
 
 func NewEvent() Event {

@@ -5,40 +5,24 @@ import (
 	"fmt"
 	"time"
 
-	cache "github.com/go-redis/cache/v9"
-	redis "github.com/redis/go-redis/v9"
-	zap "go.uber.org/zap"
-	"gorm.io/gorm"
-	gormlogger "gorm.io/gorm/logger"
 	hex "github.com/mikeyg42/HEX/models"
 	storage "github.com/mikeyg42/HEX/storage"
+	zap "go.uber.org/zap"
+	gormlogger "gorm.io/gorm/logger"
 )
 
-// ...................... game Lock ......................//
-const (	
+const (
 	moveTimeout = 30 * time.Second
 
 	shortDur = 1 * time.Second
+
+	numInitialWorkers = 10
 )
 
-
-
-
-
-
-
-//.............. Main Characters ...............//
-
-
-
-
-//................... MAIN .......................//
-//................................................//
-
 func main() {
-	
+
 	parentCtx, parentCancelFunc := context.WithCancel(context.Background())
-	
+
 	con, error := NewContainer(parentCtx, parentCancelFunc)
 	if error != nil {
 		panic(error)
@@ -49,21 +33,25 @@ func main() {
 
 	// initialize the workers and lobby
 	lobbyCtx, lobbyCancel := context.WithCancel(parentCtx)
-	numWorkers := 10
-	con.StartNewWorkerPool(lobbyCtx, lobbyCancel, numWorkers)
+	defer lobbyCancel()
+	//................................................//
+	// placeholder for the initialize workers and lobby code
+	//................................................//
 
 	// Starts the command and event dispatchers's goroutines
 	d.StartDispatcher(parentCtx)
 
+	// do some more stuff
 
+	// exit and close everything
+	GracefullyExit(con)
 }
 
 //................................................//
 
+func GracefullyExit(con *hex.Container) {
 
-func (con *hex.Container) GracefullyExiting() {
-
-	// Close the Redis client = 
+	// Close the Redis client =
 	err := con.Persister.Redis.Client.Close()
 	if err != nil {
 		con.ErrorLog.ErrorLog(context.TODO(), "Error closing Redis client:", zap.Bool("close redis client", false), zap.Error(err))
@@ -79,26 +67,22 @@ func (con *hex.Container) GracefullyExiting() {
 	// flush logger queues I think?
 	con.ErrorLog.Sync()
 	con.EventCmdLog.Sync()
-	
-	// cancel the parent context, canceling all children too
-	con.Exiter.ParentCancelFunc()
+
+	// cancel the parent context, canceling all children too, which includes all the logs
+	con.CtxExiterFn.ParentCancelFunc()
 
 }
 
 //................................................//
 
-
 func NewContainer(ctx context.Context, ctxCancelFunc context.CancelFunc) (*hex.Container, error) {
 	eventCmdLogger := storage.InitLogger("/Users/mikeglendinning/projects/HEX/eventCommandLog.log", gormlogger.Info)
 	errorLogger := storage.InitLogger("/Users/mikeglendinning/projects/HEX/errorLog.log", gormlogger.Info)
-	
+
 	eventCmdCtx := context.WithValue(ctx, hex.EventCmdLoggerKey{}, &eventCmdLogger)
 	errorLogCtx := context.WithValue(ctx, hex.ErrorLoggerKey{}, &errorLogger)
 
-	eventCmdLogger.ZapLogger.Sync()
-	errorLogger.ZapLogger.Sync()
-
-    // Initialize the RedisGameState, PostgresGameState
+	// Initialize the RedisGameState, PostgresGameState
 	gsp, RedisErr, PostgresErr := storage.InitializePersistence(ctx)
 	if gsp == nil {
 		if RedisErr != nil {
@@ -113,14 +97,14 @@ func NewContainer(ctx context.Context, ctxCancelFunc context.CancelFunc) (*hex.C
 	eventCmdLogger.InfoLog(eventCmdCtx, "EventCmdLogger Initiated", zap.Bool("EventCmdLogger Activation", true))
 	errorLogger.InfoLog(errorLogCtx, "ErrorLogger Initiated", zap.Bool("ErrorLogger Activation", true))
 
-	exiter := &hex.GracefulExit{
+	exiter := &hex.ContextMaster_exiter{
 		ParentCancelFunc: ctxCancelFunc,
 	}
-        
-    return &hex.Container{
-		Persister: 	 gsp,
-        ErrorLog:    errorLogger,
+
+	return &hex.Container{
+		Persister:   gsp,
+		ErrorLog:    errorLogger,
 		EventCmdLog: eventCmdLogger,
-		Exiter: 	 exiter,
-    }, nil
+		CtxExiterFn: exiter,
+	}, nil
 }

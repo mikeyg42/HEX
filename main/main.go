@@ -34,6 +34,7 @@ func main() {
 	// initialize the workers and lobby
 	lobbyCtx, lobbyCancel := context.WithCancel(parentCtx)
 	defer lobbyCancel()
+	
 	//................................................//
 	// placeholder for the initialize workers and lobby code
 	//................................................//

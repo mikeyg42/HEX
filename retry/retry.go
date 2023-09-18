@@ -34,7 +34,7 @@ func RetryFunc(ctx context.Context, function interface{}) *RResult {
 	typ := reflect.TypeOf(function)
 	if typ.Kind() != reflect.Func {
 		return &RResult{
-			Err:       fmt.Errorf("provided argument is not a function"),
+			Err:       fmt.Errorf("retry package error: provided argument is not a function"),
 			Message:   "Not a function",
 			Interface: nil,
 		}
@@ -137,6 +137,7 @@ func retryWithThree(ctx context.Context, function func() (string, interface{}, e
 	return &RResult{Err: fmt.Errorf("failed after %d attempts", maxRetries), Message: "Failure after retries", Interface: nil}
 }
 
+// -------------------------
 // helper function to check if an output of the function is an error
 func isErrorType(t reflect.Type) bool {
 	return t == reflect.TypeOf((*error)(nil)).Elem()

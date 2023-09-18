@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"context"
 
 	hex "github.com/mikeyg42/HEX/models"
 )
@@ -17,19 +18,23 @@ const (
 
 func NewLobby() *Lobby {
 	return &Lobby{
-		Games:   make(chan Game, 0),
-		Results: make(chan Result, 0),
+		GamesChan:   make(chan hex.MatchmakingEvt, 0),
+		ResultsChan: make(chan hex.GameEndEvent, 0),
 	}
 }
 
-func (l *Lobby) Run() {
+func (l *Lobby) Run(ctx context.Context) {
 	var wg sync.WaitGroup
+
+	// USE CONTEXT
+
+
 
 	// Create initial workers
 	for w := 1; w <= initialNumWorkers; w++ {
 		wg.Add(1)
 		go func(workerID int) {
-			worker(workerID, l.Games, l.Results)
+			NewWorker(workerID, l.GamesChan, l.ResultsChan)
 			wg.Done()
 		}(w)
 	}
@@ -37,7 +42,7 @@ func (l *Lobby) Run() {
 	numWorkers := initialNumWorkers
 	// Monitor the Games channel length
 	go func() {
-		for range time.Tick(time.Second) {
+		for range time.Tick(20 * time.Second) {
 			queueSize := len(l.Games)
 			if queueSize > maxQueueSize && numWorkers < maxWorkers {
 				// Increase the number of workers
@@ -47,7 +52,7 @@ func (l *Lobby) Run() {
 				wg.Add(1)
 
 				go func(workerID int) {
-					worker(workerID, l.Games, l.Results)
+					NewWorker(workerID, l.Games, l.Results)
 					wg.Done()
 				}(numWorkers)
 
@@ -56,6 +61,7 @@ func (l *Lobby) Run() {
 				fmt.Println("Decreasing the number of workers to", numWorkers-1)
 				numWorkers--
 			}
+		
 		}
 	}()
 
@@ -68,16 +74,19 @@ func (l *Lobby) Run() {
 
 	// Collect Results
 	go func() {
-		for r := range l.Results {
+		for r := range l.ResultsChan {
 			fmt.Println("Game", r.GameID, "result:", r.Result)
 		}
 	}()
 
-	// Assign Games to workers
-	// This can be populated by your matchmaking logic
-	/*     for j := 1; j <= numGames; j++ {
-	       l.Games <- Game{ID: j, Data: j}
-	   } */
+	//Assign Games to workers
+	go func() {
+		for game := range l.GamesChan {
+	       playerA := game.PlayerA_ID
+		   playerB :=  game.PlayerB_ID
+			// do some stuff
+		}
+	}()
 
 	// Graceful shutdown
 	<-waitForShutdown
@@ -87,34 +96,18 @@ func (l *Lobby) Run() {
 
 func main() {
 	lobby := NewLobby()
-	go lobby.Run()
-}
+	
+	ctx := context.Background()
 
-func StartWorker(con *hex.Container, id int, Games <-chan Game, Results chan<- Result) {
-	w := new(Worker) // create a new worker
+	go lobby.Run(ctx)
 
-	for game := range Games {
-		fmt.Println("Worker", id, "started game", game.ID)
-
-		w.runGame(game, con)
-
-		// TODO: Fetch the result from the game execution
-		// result := ...
-		
-		Results <- Result{GameID: game.ID, Result: result}
-	}
 }
 
 func (l *Lobby) AddPlayer(player PlayerIdentity) {
 	l.PlayerQueue <- player
 }
 
-func (l *Lobby) RegisterWorker(worker *Worker) {
+func (l *Lobby) AddWorkerToArray(worker *Worker) {
 	l.workerQueue <- worker
 }
 
-func InitLobby(numWorkers int) *Lobby {
-	lobby := NewLobby()
- 	go lobby.Run()
-	return lobby
-}

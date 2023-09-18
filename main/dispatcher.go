@@ -10,19 +10,18 @@ import (
 	pubsub "github.com/mikeyg42/HEX/pubsub"
 	storage "github.com/mikeyg42/HEX/storage"
 	zap "go.uber.org/zap"
+	timerpkg "github.com/mikeyg42/HEX/timerpkg"
 )
 
 // Dispatcher represents the combined event and command dispatcher.
 type Dispatcher struct {
 	Container       *hex.Container
-	commandHandlers map[string]func(interface{})
-	eventHandlers   map[string]func(interface{})
 	CommandChan     chan interface{}
 	EventChan       chan interface{}
 	// to initiate a game:
 	StartChan chan pubsub.Command
 	// to give handlers access to timer:
-	Timer hex.TimerController
+	Timer *timerpkg.TimerControl
 }
 
 func NewDispatcher(ctx context.Context, container *hex.Container) *Dispatcher {

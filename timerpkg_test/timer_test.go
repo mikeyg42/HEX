@@ -30,8 +30,7 @@ func TestTimer_StartAndStop(t *testing.T) {
 	// Sleep for a duration greater than the timer's remaining duration to ensure it doesn't trigger the expiration
 	time.Sleep(25 * time.Second)
 
-	// ... Check any expected behaviors here.
-	// For example, you could use channels to signal from your timer code to this test to assert certain behaviors occurred or did not occur.
+	// ...
 }
 
 func TestTimer_Expiration(t *testing.T) {
@@ -49,8 +48,5 @@ func TestTimer_Expiration(t *testing.T) {
 	// Sleep for a duration greater than the timer's total duration to let it expire
 	time.Sleep(35 * time.Second)
 
-	// ... Check any expected behaviors here.
-	// For example, check that the forfeit logic was triggered.
+	// ...
 }
-
-// ... more tests for other behaviors ...

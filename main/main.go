@@ -39,7 +39,7 @@ func main() {
 	//................................................//
 
 	// Starts the command and event dispatchers's goroutines
-	d.StartDispatcher(parentCtx)
+	d.StartDispatcher(parentCtx, con.ErrorLog)
 
 	// do some more stuff
 

@@ -8,7 +8,6 @@ import (
 
 	hex "github.com/mikeyg42/HEX/models"
 	pubsub "github.com/mikeyg42/HEX/pubsub"
-	storage "github.com/mikeyg42/HEX/storage"
 	timerpkg "github.com/mikeyg42/HEX/timerpkg"
 	zap "go.uber.org/zap"
 )
@@ -24,6 +23,7 @@ type Dispatcher struct {
 	PG      *hex.PostgresGameState
 	RS      *hex.RedisGameState
 	ErrChan chan error
+	Logger  hex.LogController
 }
 
 // START-CHAN IS UNUSED!!!!
@@ -36,6 +36,7 @@ func NewDispatcher(ctx context.Context, container *hex.Container) (*Dispatcher, 
 		PG:        container.Persister.Postgres,
 		RS:        container.Persister.Redis,
 		ErrChan:   make(chan error),
+		Logger:   container.ErrorLog,
 	}
 
 	//  the DONE chan controls the Dispatcher!
@@ -48,14 +49,13 @@ func NewDispatcher(ctx context.Context, container *hex.Container) (*Dispatcher, 
 }
 
 // Start starts the command and event Dispatchers.
-func (d *Dispatcher) StartDispatcher(ctx context.Context) chan<- error {
+func (d *Dispatcher) StartDispatcher(ctx context.Context, logger hex.LogController) chan<- error {
 	errChan := make(chan error) // create an error channel
 
 	go d.eventDispatcher(ctx, errChan)
 
 	// Let's listen to our error channel now
 	go func() {
-		
 		for err := range errChan {
 			// Log the error or handle it appropriately.
 			logger.ErrorLog(ctx, "Error sent to errorChan in Dispatcher", zap.Error(err))

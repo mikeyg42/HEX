@@ -6,17 +6,16 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"time"
 	"sync"
+	"time"
 
+	logic "github.com/mikeyg42/HEX/logic"
 	hex "github.com/mikeyg42/HEX/models"
 	pubsub "github.com/mikeyg42/HEX/pubsub"
+	retry "github.com/mikeyg42/HEX/retry"
 	storage "github.com/mikeyg42/HEX/storage"
 	redis "github.com/redis/go-redis/v9"
 	zap "go.uber.org/zap"
-	logic "github.com/mikeyg42/HEX/logic"
-	retry "github.com/mikeyg42/HEX/retry"
-
 )
 
 //................. HANDLERS .....................//
@@ -35,26 +34,25 @@ func (d *Dispatcher) handleEvent(done <-chan struct{}, event pubsub.Eventer, eve
 
 	switch event := event.(type) {
 	case *hex.InvalidMoveEvent:
-		con.ErrorLog.InfoLog(ctx, "Received InvalidMoveEvent", zap.String("GameID", event.GameID), zap.String("PlayerID", event.PlayerID), zap.String("InvalidMove", event.InvalidMove))
+		d.Logger.InfoLog(ctx, "Received InvalidMoveEvent", zap.String("GameID", event.GameID), zap.String("PlayerID", event.PlayerID), zap.String("InvalidMove", event.InvalidMove))
 
 	case *hex.OfficialMoveEvent:
 		strs := []string{event.GameID, event.PlayerID, "has made a move:", event.MoveData}
-		con.EventCmdLog.InfoLog(ctx, strings.Join(strs, "/"))
+		d.Logger.InfoLog(ctx, strings.Join(strs, "/"))
 
 		// To get here means the player's move was valid! Therefore, we can stop their countdown. we will start new one after processing this move
 		d.Timer.StopTimer()
 
 		// This will parse the new move and then publish another message to the event bus that will be picked up by persisting logic and the win condition logic
-		newEvt := Handler_OfficialMoveEvt(ctx, event, con)
+		newEvt := d.Handler_OfficialMoveEvt(ctx, event)
 		//newEvt is type  *hex.GameStateUpdate
 		d.EventDispatcher(newEvt)
 
 	case *hex.GameStateUpdate:
 		// Persist the data and check win conditions
-		newEvt := HandleGameStateUpdate(event)
+		newEvt := d.HandleGameStateUpdate(event)
 
-		// ADD THIS FUNCTION IN?
-
+		// ...?
 
 		d.EventDispatcher(newEvt)
 
@@ -67,7 +65,7 @@ func (d *Dispatcher) handleEvent(done <-chan struct{}, event pubsub.Eventer, eve
 		//moveParts[2] is the moveCounter
 		if moveParts[2] == "1" || moveParts[2] == "2" {
 			// these moves are handled by independent logic and should not trigger this command
-			con.ErrorLog.InfoLog(ctx, "Invalid command delivered to command bus", zap.String("Move", newMoveData), zap.String("GameID", evt.GameID), zap.String("PlayerID", evt.SourcePlayerID))
+			d.Logger.InfoLog(ctx, "Invalid command delivered to command bus", zap.String("Move", newMoveData), zap.String("GameID", evt.GameID), zap.String("PlayerID", evt.SourcePlayerID))
 		}
 
 		// pull moveList from redis cache, falling back onto successive persistence layers
@@ -81,7 +79,7 @@ func (d *Dispatcher) handleEvent(done <-chan struct{}, event pubsub.Eventer, eve
 		// now, from our command, we can look into the moveList and see if the move is valid
 		new_key, err := strconv.Atoi(moveParts[0]) // new_key is the move counter.
 		if err != nil {
-			con.ErrorLog.ErrorLog(ctx, "Error converting moveCounter to int", zap.Error(err))
+			d.Logger.ErrorLog(ctx, "Error converting moveCounter to int", zap.Error(err))
 		}
 		new_val := moveParts[2] // new_val is the concatenated x and y coordinates of the most recent move
 
@@ -95,7 +93,7 @@ func (d *Dispatcher) handleEvent(done <-chan struct{}, event pubsub.Eventer, eve
 			}
 			if value == new_val {
 				// Value already exists in the moveList.
-				con.ErrorLog.ErrorLog(ctx, "Invalid, duplicate move detected", zap.String("Move", new_val), zap.String("GameID", evt.GameID), zap.String("PlayerID", evt.SourcePlayerID))
+				d.Logger.ErrorLog(ctx, "Invalid, duplicate move detected", zap.String("Move", new_val), zap.String("GameID", evt.GameID), zap.String("PlayerID", evt.SourcePlayerID))
 
 				newEvent := &hex.InvalidMoveEvent{
 					GameID:      event.GameID,
@@ -182,9 +180,10 @@ func (d *Dispatcher) handleEvent(done <-chan struct{}, event pubsub.Eventer, eve
 		// Check if the game is not claimed by another goroutine!!!!
 		if isGameLocked(event.GameID) {
 			// if it is, we need to kill the worker that is trying to start the duplicate game
-			workerID := lockedGame.WorkerID
+			lg := accessLockedGame(event.GameID)
+			workerID := lg.WorkerID
 			killWorker(workerID)
-				// DEFINE A KILL WORKER FUNCTION
+			// DEFINE A KILL WORKER FUNCTION
 			return nil
 		}
 
@@ -211,7 +210,7 @@ func (d *Dispatcher) handleEvent(done <-chan struct{}, event pubsub.Eventer, eve
 
 	default:
 		con.EventCmdLog.InfoLog(ctx, "Received Unusual, unknown event: %v", zap.String("eventType", reflect.TypeOf(event).String()))
-		con.ErrorLog.ErrorLog(ctx, "unknown event type: %v", zap.Error(fmt.Errorf("weird event type: %v", event)))
+		d.Logger.ErrorLog(ctx, "unknown event type", zap.Error(fmt.Errorf("weird event type: %v", event)))
 
 	}
 	return nil
@@ -226,7 +225,7 @@ func isGameLocked(key string) bool {
 	return exists
 }
 
-func  parseOfficialMoveEvt(ctx context.Context, e *hex.OfficialMoveEvent) (*hex.GameStateUpdate, error) {
+func parseOfficialMoveEvt(ctx context.Context, e *hex.OfficialMoveEvent) (*hex.GameStateUpdate, error) {
 	// parses the OfficialMoveEvent and returns a GameStateUpdate struct, the next event in the progresssion, this struct is saveable in DB
 	moveParts := strings.Split(e.MoveData, ".")
 
@@ -270,21 +269,19 @@ func  parseOfficialMoveEvt(ctx context.Context, e *hex.OfficialMoveEvent) (*hex.
 func (d *Dispatcher) Handler_OfficialMoveEvt(ctx context.Context, evt *hex.OfficialMoveEvent) {
 
 	updateToBePersisted, err := parseOfficialMoveEvt(ctx, evt)
-	if err != nil {
-		d.ErrChan <- err
-	}
-	
+	d.Logger.ErrorLog(ctx, "error parsing OfficialMoveEvent", zap.Error(err))
+
 	d.PersistNewMove(ctx, updateToBePersisted, d.PG, d.RS)
-	
+
 	// get all the info needed to start the timer again, and then do so
 	moveParts := strings.Split(evt.MoveData, ".")
 	moveCounter, err := strconv.Atoi(moveParts[0])
 	if err != nil {
-		d.ErrorLog.ErrorLog(ctx, "error extracting moveCounter", zap.Error(err))
+		d.Logger.ErrorLog(ctx, "error extracting moveCounter", zap.Error(err))
 	}
-	hex.AllLockedGames.Lock()
-	lg := hex.AllLockedGames[evt.GameID]
-	hex.AllLockedGames.Unlock()
+
+	lg := accessLockedGame(evt.GameID)
+
 	var nextPlayer string
 	if lg.InitialPlayer.PlayerID == evt.PlayerID {
 		nextPlayer = lg.SwapPlayer.PlayerID
@@ -294,21 +291,21 @@ func (d *Dispatcher) Handler_OfficialMoveEvt(ctx context.Context, evt *hex.Offic
 
 	newEvt := &hex.TimerON_StartTurnAnnounceEvt{
 		GameID:          evt.GameID,
-		LastTurnEndTime: time.Now(), 
+		LastTurnEndTime: time.Now(),
 		ThisTurnEndTime: time.Now().Add(moveTimeout),
-		MoveNumber:      moveCounter+1,
-		ActivePlayerID: nextPlayer,
+		MoveNumber:      moveCounter + 1,
+		ActivePlayerID:  nextPlayer,
 	}
 	d.Timer.StartTimer()
 	d.EventDispatcher(newEvt)
-	
-	return 
+
+	return
 
 }
 
 func (d *Dispatcher) PersistNewMove(ctx context.Context, newMove *hex.GameStateUpdate, pg *hex.PostgresGameState, rs *hex.RedisGameState) interface{} {
 
-	logger := pg.Logger.ErrorLog
+	logger := d.Logger.ErrorLog
 
 	playerID := newMove.PlayerID
 	moveCounter := newMove.MoveCounter
@@ -338,7 +335,7 @@ func (d *Dispatcher) PersistNewMove(ctx context.Context, newMove *hex.GameStateU
 	go func() {
 		defer wg.Done()
 		win_yn := logic.EvalWinCondition(newAdjG, newMoveList)
- 		winChan <- win_yn
+		winChan <- win_yn
 	}()
 	go func() {
 		defer wg.Done()
@@ -364,15 +361,13 @@ func (d *Dispatcher) PersistNewMove(ctx context.Context, newMove *hex.GameStateU
 		}
 	}()
 
-	wg.Wait() // Wait for all actions to complete
+	wg.Wait()           // Wait for all actions to complete
 	win_yn := <-winChan // extract the win condition from the channel
 	close(winChan)
 
 	if win_yn {
 		// use the lockedGames map to ascertain who opponent is (ie who's turn is next )
-		hex.AllLockedGames.Lock()
-		lg := hex.AllLockedGames[gameID] //check all lockedGames map
-		hex.AllLockedGames.Unlock()
+		lg := accessLockedGame(gameID)
 
 		loserID := lg.Player1.PlayerID
 		if lg.Player1.PlayerID == playerID {
@@ -405,4 +400,13 @@ func (d *Dispatcher) PersistNewMove(ctx context.Context, newMove *hex.GameStateU
 	}
 
 	// include a check to compare redis and postgres?
+}
+
+func accessLockedGame(gameID string) *hex.LockedGame {
+	hex.LockMutex.Lock()
+	defer hex.LockMutex.Unlock()
+
+	lg := hex.AllLockedGames[gameID]
+
+	return lg
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	cache "github.com/go-redis/cache/v9"
+	logic "github.com/mikeyg42/HEX/logic"
 	hex "github.com/mikeyg42/HEX/models"
 	retry "github.com/mikeyg42/HEX/retry"
 	redis "github.com/redis/go-redis/v9"
@@ -254,6 +255,7 @@ func FetchGameState(ctx context.Context, gameID, playerID string, rs *hex.RedisG
 
 	var moveCounter int = -1
 
+	// if either of the above didn't work, then we need to call recreateGS_postgres. to do that we need to have defined the moveCounter...
 	if err2 == nil {
 		moveCounter = len(moveList)
 	} else if err2 != nil && err == nil {
@@ -264,9 +266,9 @@ func FetchGameState(ctx context.Context, gameID, playerID string, rs *hex.RedisG
 			panic(fmt.Errorf("adjGraph is not square"))
 		}
 	}
-
+	// now, with the moveCounter defined, we can call recreateGS_postgres her
 	if err != nil || err2 != nil {
-		err3 := fmt.Errorf("redis persistence failed, falling back to postgres: %v", errors.Join(err, err2))
+		rs.Logger.InfoLog(ctx, "redis persistence failed, falling back to postgres", zap.Error(errors.Join(err, err2)))
 		if moveCounter != -1 {
 			adjGraph, moveList, err4 := RecreateGS_Postgres(ctx, playerID, gameID, moveCounter, pg)
 			if err4 != nil {
@@ -274,7 +276,7 @@ func FetchGameState(ctx context.Context, gameID, playerID string, rs *hex.RedisG
 			}
 			return adjGraph, moveList
 		} else {
-			panic(err3)
+			panic(fmt.Errorf("error defining moveCounter in persistence layer, function fetchgamestate"))
 		}
 	}
 
@@ -302,7 +304,7 @@ func FetchPlayerMoves(ctx context.Context, gameID, playerID string, rs *hex.Redi
 		var move hex.Vertex
 		err = json.Unmarshal([]byte(moveStr), &move)
 		if err != nil {
-			// Handle unmarshalling error somehow? (this error usually is a type error or a pointer to nil or something)
+			// Handle unmarshalling error somehow? (this is a dev error - usually its a type error or a pointer to nil or something)
 			return emptyVal, err
 		}
 		moves = append(moves, move)
@@ -391,33 +393,33 @@ func MasterFetchingMoveList(ctx context.Context, gameID string, rs *hex.RedisGam
 	// 1. Try fetching from cache.
 	cacheCtx, cancelCache := context.WithTimeout(ctx, 1*time.Second)
 	defer cancelCache()
-	moveList, err := FetchMoveListFromCache(cacheCtx, gameID, rs)
-	if err == nil && len(moveList) > 1 {
+	moveList, err1 := FetchCombinedlist_cache(cacheCtx, gameID, rs)
+	if err1 == nil && len(moveList) > 1 {
 		return moveList, nil
 	}
-	rs.Logger.InfoLog(cacheCtx, "Cache could not retrieve Move List", zap.String("gameID", gameID), zap.Error(err))
+	rs.Logger.InfoLog(cacheCtx, "Cache could not retrieve Move List in time", zap.String("gameID", gameID), zap.Error(err1))
 
 	// 2. If cache misses, try fetching from Redis.
 	redisCtx, cancelRedis := context.WithTimeout(ctx, 2*time.Second)
 	defer cancelRedis()
-	moveList, err = FetchMoveListFromRedis(redisCtx, gameID, rs)
-	if err == nil && len(moveList) > 1 {
+	moveList, err2 := FetchCombinedlist_redis(redisCtx, gameID, rs)
+	if err2 == nil && len(moveList) > 1 {
 		return moveList, nil
 	}
-	rs.Logger.InfoLog(redisCtx, "Redis could not retrieve Move List", zap.String("gameID", gameID), zap.Error(err))
+	rs.Logger.InfoLog(redisCtx, "Redis could not retrieve Move List in time", zap.String("gameID", gameID), zap.Error(err2))
 	cancelRedis()
 
 	// 3. If Redis fails, try fetching from Postgres.
 	pgCtx, cancelPg := context.WithTimeout(ctx, 3*time.Second)
 	defer cancelPg()
-	moveList, err = FetchMoveListFromPostgres(pgCtx, gameID, pg)
-	if err != nil {
-		return nil, err // If even Postgres fails, return the error.
+	moveList, err3 := FetchCombinedlist_postgres(pgCtx, gameID, pg)
+	if err3 != nil {
+		return nil, errors.Join(err1, err2, err3) // If Postgres fails, return all the error.
 	}
 	return moveList, nil
 }
 
-func FetchMoveListFromCache(ctx context.Context, gameID string, rs *hex.RedisGameState) (map[int]string, error) {
+func FetchCombinedlist_cache(ctx context.Context, gameID string, rs *hex.RedisGameState) (map[int]string, error) {
 	cache := rs.MyCache
 	cacheKey := fmt.Sprintf("cache:%s:movelist", gameID)
 	moveList := make(map[int]string)
@@ -427,7 +429,7 @@ func FetchMoveListFromCache(ctx context.Context, gameID string, rs *hex.RedisGam
 	return moveList, nil
 }
 
-func FetchMoveListFromRedis(ctx context.Context, gameID string, rs *hex.RedisGameState) (map[int]string, error) {
+func FetchCombinedlist_redis(ctx context.Context, gameID string, rs *hex.RedisGameState) (map[int]string, error) {
 
 	lg := hex.AllLockedGames[gameID]
 
@@ -454,7 +456,7 @@ func FetchMoveListFromRedis(ctx context.Context, gameID string, rs *hex.RedisGam
 	return fetchedMoves, nil
 }
 
-func FetchMoveListFromPostgres(ctx context.Context, gameID string, pg *hex.PostgresGameState) (map[int]string, error) {
+func FetchCombinedlist_postgres(ctx context.Context, gameID string, pg *hex.PostgresGameState) (map[int]string, error) {
 	xCoords, yCoords, moveNumber, err := FetchGS_sql(ctx, gameID, "all", pg)
 	if err != nil {
 		return nil, err
@@ -470,7 +472,7 @@ func FetchMoveListFromPostgres(ctx context.Context, gameID string, pg *hex.Postg
 
 func RecreateGS_Postgres(ctx context.Context, playerID, gameID string, moveCounter int, pg *hex.PostgresGameState) ([][]int, []hex.Vertex, error) {
 
-	// this function assumes that you have NOT yet incorporated the newest move into this postgres. but moveCounter input is that of the new move yet to be added
+	// this function assumes that you have NOT yet incorporated the newest move into this postgres. so moveCounter input is that of the new move yet to be added
 	adjGraph := [][]int{{0, 0}, {0, 0}}
 	moveList := []hex.Vertex{}
 
@@ -487,12 +489,14 @@ func RecreateGS_Postgres(ctx context.Context, playerID, gameID string, moveCount
 			return nil, nil, fmt.Errorf("found more moves than anticipated")
 		}
 	}
+
+	// i should be able to just get rid of this entirely because the first two turns have their own logic
 	if moveCounter == 1 || moveCounter == 2 {
 		switch len(xCoords) {
 		case 0:
 			return adjGraph, moveList, nil
 		case 1:
-			vert, err := hex.ConvertToTypeVertex(xCoords[0], yCoords[0])
+			vert, err := logic.ConvertToTypeVertex(xCoords[0], yCoords[0])
 			if err != nil {
 				return nil, nil, err
 			}
@@ -505,12 +509,12 @@ func RecreateGS_Postgres(ctx context.Context, playerID, gameID string, moveCount
 	}
 
 	for i := 0; i < len(xCoords); i++ {
-		modVert, err := hex.ConvertToTypeVertex(xCoords[i], yCoords[i])
+		modVert, err := logic.ConvertToTypeVertex(xCoords[i], yCoords[i])
 		if err != nil {
 			return nil, nil, err
 		}
 
-		adjGraph, moveList = hex.IncorporateNewVert(ctx, moveList, adjGraph, modVert)
+		adjGraph, moveList = logic.IncorporateNewVert(ctx, moveList, adjGraph, modVert)
 	}
 
 	return adjGraph, moveList, nil

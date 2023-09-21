@@ -29,12 +29,11 @@ func main() {
 	}
 
 	// Initialize command and event dispatchers
-	d := NewDispatcher(parentCtx, con)
+	d, doneDispatcher := NewDispatcher(parentCtx, con)
 
 	// initialize the workers and lobby
-	lobbyCtx, lobbyCancel := context.WithCancel(parentCtx)
-	defer lobbyCancel()
-	
+	lobbyCtx := parentCtx
+
 	//................................................//
 	// placeholder for the initialize workers and lobby code
 	//................................................//
@@ -45,13 +44,16 @@ func main() {
 	// do some more stuff
 
 	// exit and close everything
-	GracefullyExit(con)
+	GracefullyExit(con, doneDispatcher)
 }
 
 //................................................//
 
-func GracefullyExit(con *hex.Container) {
-
+func GracefullyExit(con *hex.Container, doneDispatcher chan struct{}) {
+	
+	doneDispatcher <- struct{}{}
+	close(doneDispatcher)// send a signal to the dispatcher to stop
+	
 	// Close the Redis client =
 	err := con.Persister.Redis.Client.Close()
 	if err != nil {

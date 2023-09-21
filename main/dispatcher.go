@@ -9,80 +9,59 @@ import (
 	hex "github.com/mikeyg42/HEX/models"
 	pubsub "github.com/mikeyg42/HEX/pubsub"
 	storage "github.com/mikeyg42/HEX/storage"
-	zap "go.uber.org/zap"
 	timerpkg "github.com/mikeyg42/HEX/timerpkg"
+	zap "go.uber.org/zap"
 )
 
 // Dispatcher represents the combined event and command dispatcher.
 type Dispatcher struct {
-	Container       *hex.Container
-	CommandChan     chan interface{}
-	EventChan       chan interface{}
+	Container *hex.Container // GETTING RID OF THIS SLOWLY
+	EventChan chan interface{}
 	// to initiate a game:
-	StartChan chan pubsub.Command
+	StartChan chan pubsub.Event
 	// to give handlers access to timer:
-	Timer *timerpkg.TimerControl
+	Timer   *timerpkg.TimerControl
+	PG      *hex.PostgresGameState
+	RS      *hex.RedisGameState
+	ErrChan chan error
 }
 
-func NewDispatcher(ctx context.Context, container *hex.Container) *Dispatcher {
+// START-CHAN IS UNUSED!!!!
+
+func NewDispatcher(ctx context.Context, container *hex.Container) (*Dispatcher, chan struct{}) {
 	d := &Dispatcher{
-		CommandChan: make(chan interface{}),
-		EventChan:   make(chan interface{}),
-		Container:   container,
-		StartChan:   make(chan pubsub.Command),
+		EventChan: make(chan interface{}),
+		Container: container,
+		StartChan: make(chan pubsub.Event),
+		PG:        container.Persister.Postgres,
+		RS:        container.Persister.Redis,
+		ErrChan:   make(chan error),
 	}
 
 	//  the DONE chan controls the Dispatcher!
 	done := make(chan struct{})
-	errChan := make(chan error)
 
 	// Subscribe to Redis Pub/Sub channels for commands and events
-	d.subscribeToCommands(done, errChan)
-	d.subscribeToEvents(done, errChan)
+	d.subscribeToEvents(done)
 
-	return d
+	return d, done
 }
 
 // Start starts the command and event Dispatchers.
 func (d *Dispatcher) StartDispatcher(ctx context.Context) chan<- error {
 	errChan := make(chan error) // create an error channel
 
-	go d.commandDispatcher(ctx, errChan)
 	go d.eventDispatcher(ctx, errChan)
 
 	// Let's listen to our error channel now
 	go func() {
+		
 		for err := range errChan {
 			// Log the error or handle it appropriately.
-			logger, ok := ctx.Value(hex.ErrorLoggerKey{}).(*storage.Logger)
-			if !ok {
-				logger.ErrorLog(ctx, "Error in Dispatcher", zap.Error(err))
-			}
+			logger.ErrorLog(ctx, "Error sent to errorChan in Dispatcher", zap.Error(err))
 		}
 	}()
 	return errChan
-}
-
-// CommandDispatcher is FIRST STOP for a message in this channel - it dispatches the command to the appropriate channel.
-func (d *Dispatcher) CommandDispatcher(cmd interface{}) {
-	d.CommandChan <- cmd
-}
-
-func (d *Dispatcher) commandDispatcher(ctx context.Context, errChan chan<- error) {
-
-	for cmd := range d.CommandChan {
-		payload, err := json.Marshal(cmd)
-		if err != nil {
-			errChan <- err
-		}
-
-		// Publish command to Redis Pub/Sub channel
-
-		err = d.Container.Persister.Redis.Client.Publish(ctx, "commands", payload).Err()
-		if err != nil {
-			errChan <- err
-		}
-	}
 }
 
 // EventDispatcher dispatches the event to the appropriate channel.
@@ -95,71 +74,24 @@ func (d *Dispatcher) eventDispatcher(ctx context.Context, errChan chan<- error) 
 
 		payload, err := json.Marshal(event)
 		if err != nil {
-			errChan <- err
+			d.ErrChan <- err
 		}
 
 		// Publish event to Redis Pub/Sub channel
-		err = d.Container.Persister.Redis.Client.Publish(ctx, "events", payload).Err()
+		err = d.RS.Client.Publish(ctx, "events", payload).Err()
 		if err != nil {
-			errChan <- err
+			d.ErrChan <- err
 		}
 	}
 }
 
-// Subscribe to commands and events with the done channel
-// subscribeToCommands with error channel
-func (d *Dispatcher) subscribeToCommands(done <-chan struct{}, errChan chan<- error) {
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	commandPubSub := d.Container.Persister.Redis.Client.Subscribe(ctx, "commands")
-	defer cancelFunc()
-	defer commandPubSub.Close()
-
-	// Command receiver/handler
-	go func() {
-		cmdCh := commandPubSub.Channel()
-		for {
-			select {
-			case <-done:
-				commandPubSub.Close()
-				return
-			case msg := <-cmdCh:
-				cmdType, found := hex.CmdTypeMap[msg.Channel]
-				if !found {
-					err := fmt.Errorf("unknown command type: %s", cmdType.(string))
-					d.Container.ErrorLog.InfoLog(ctx, "unknown command type", zap.String("cmdType", cmdType.(string)))
-					errChan <- err
-					continue
-				}
-
-				cmdValue := reflect.New(reflect.TypeOf(cmdType).Elem()).Interface()
-				err := json.Unmarshal([]byte(msg.Payload), &cmdValue)
-				if err != nil {
-					err = fmt.Errorf("Error unmarshaling %s: %v\n", msg.Channel, err)
-					d.Container.ErrorLog.ErrorLog(ctx, err.Error(), zap.Error(err))
-					errChan <- err
-					continue
-				}
-				// Type assertion to ensure that the unmarshaled event implements the Command interface
-				cmdTypeAsserted, ok := cmdValue.(pubsub.Commander)
-				if !ok {
-					err := fmt.Errorf("unmarshaled command does not implement Event interface")
-					d.Container.ErrorLog.InfoLog(ctx, err.Error(), zap.Error(err))
-					errChan <- err
-					continue
-				}
-				d.handleCommand(done, cmdTypeAsserted, commandPubSub)
-			}
-		}
-	}()
-}
-
 // subscribeToEvents with error channel
-func (d *Dispatcher) subscribeToEvents(done <-chan struct{}, errChan chan<- error) {
+func (d *Dispatcher) subscribeToEvents(done <-chan struct{}) {
 	// use a cancelable context that will end when the goroutine ends automatically (or earlier)
 	ctx, cancelFunc := context.WithCancel(context.Background())
 
 	// subscribe to the events channel (not the same as recieving though!)
-	eventPubSub := d.Container.Persister.Redis.Client.Subscribe(ctx, "events")
+	eventPubSub := d.RS.Client.Subscribe(ctx, "events")
 	defer eventPubSub.Close()
 	defer cancelFunc()
 
@@ -175,8 +107,7 @@ func (d *Dispatcher) subscribeToEvents(done <-chan struct{}, errChan chan<- erro
 				eventType, found := hex.EventTypeMap[msg.Channel]
 				if !found {
 					err := fmt.Errorf("unknown event type: %s", msg.Channel)
-					d.Container.ErrorLog.InfoLog(ctx, err.Error())
-					errChan <- err
+					d.ErrChan <- err
 					continue
 				}
 
@@ -184,8 +115,7 @@ func (d *Dispatcher) subscribeToEvents(done <-chan struct{}, errChan chan<- erro
 				err := json.Unmarshal([]byte(msg.Payload), &eventValue)
 				if err != nil {
 					err = fmt.Errorf("Error unmarshaling %s: %v\n", msg.Channel, err)
-					d.Container.ErrorLog.ErrorLog(ctx, err.Error(), zap.Error(err))
-					errChan <- err
+					d.ErrChan <- err
 					continue
 				}
 
@@ -193,8 +123,7 @@ func (d *Dispatcher) subscribeToEvents(done <-chan struct{}, errChan chan<- erro
 				evtTypeAsserted, ok := eventValue.(pubsub.Eventer)
 				if !ok {
 					err := fmt.Errorf("unmarshaled event does not implement Event interface")
-					d.Container.ErrorLog.InfoLog(ctx, err.Error(), zap.Error(nil))
-					errChan <- err
+					d.ErrChan <- err
 					continue
 				}
 

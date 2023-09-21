@@ -14,7 +14,7 @@ func TestTimer_StartAndStop(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	defer logger.Sync()
 
-	ctx := context.WithValue(context.Background(), timerpkg.TimerLoggerKey{}, logger)
+	ctx := context.WithValue(context.Background(), testingLoggerKey{}, logger)
 
 	timer := timerpkg.MakeNewTimer(ctx)
 
@@ -29,6 +29,8 @@ func TestTimer_StartAndStop(t *testing.T) {
 
 	// Sleep for a duration greater than the timer's remaining duration to ensure it doesn't trigger the expiration
 	time.Sleep(25 * time.Second)
+	
+	
 
 	// ...
 }

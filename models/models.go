@@ -132,75 +132,10 @@ type PlayerIdentity struct {
 
 type EventCmdLoggerKey struct{}
 type ErrorLoggerKey struct{}
+
 // -- i moved this to the timer package
 
 type ContextFn func(ctx context.Context) []zapcore.Field
-
-// .................. EXIT ........................//
-
-var CmdTypeMap = map[string]interface{}{
-	"DeclaringMoveCmd":    &DeclaringMoveCmd{},
-	"LetsStartTheGameCmd": &LetsStartTheGameCmd{},
-	"PlayerForfeitingCmd": &PlayerForfeitingCmd{},
-	"NextTurnStartingCmd": &NextTurnStartingCmd{},
-	"SwapTileCmd":         &SwapTileCmd{},
-	"PlayInitialTileCmd":  &PlayInitialTileCmd{},
-}
-
-type NextTurnStartingCmd struct {
-	pubsub.Command
-	GameID             string
-	PriorPlayerID      string
-	NextPlayerID       string
-	UpcomingMoveNumber int
-}
-
-type DeclaringMoveCmd struct {
-	pubsub.Command
-	GameID         string `json:"gameId"`
-	SourcePlayerID string `json:"playerId"`
-	DeclaredMove   string `json:"moveData"`
-}
-
-type CheckForWinConditionCmd struct {
-	pubsub.Command
-	GameID    string `json:"gameId"`
-	MoveCount int    `json:"moveCount"`
-	PlayerID  string `json:"playerId"`
-}
-
-// this event is sent only by the worker's runGame command
-type LetsStartTheGameCmd struct {
-	pubsub.Command
-	GameID          string `json:"gameId"`
-	NextMoveNumber  int    `json:"nextMoveNumber"`
-	InitialPlayerID string `json:"initialPlayerId"`
-	SwapPlayerID    string `json:"swapPlayerId"`
-}
-
-type PlayerForfeitingCmd struct {
-	pubsub.Command
-	GameID         string `json:"gameId"`
-	SourcePlayerID string `json:"playerId"`
-	Reason         string `json:"reason"`
-}
-
-type PlayInitialTileCmd struct {
-	pubsub.Command
-	GameID          string `json:"gameId"`
-	InitialPlayerID string `json:"initialplayerId"`
-	SwapPlayerID    string `json:"swapplayerId"`
-	StartTime       string `json:"starttime"`
-}
-
-type SwapTileCmd struct {
-	pubsub.Command
-	GameID                string `json:"gameId"`
-	InitialPlayerID       string `json:"initialplayerId"`
-	SwapPlayerID          string `json:"swapplayerId"`
-	InitialTileCoordinate string `json:"initialtilecoordinate"`
-	StartTime             string `json:"starttime"`
-}
 
 // ................ events ......................//
 var EventTypeMap = map[string]interface{}{
@@ -212,6 +147,10 @@ var EventTypeMap = map[string]interface{}{
 	"GameStartEvent":               &GameStartEvent{},
 	"TimerON_StartTurnAnnounceEvt": &TimerON_StartTurnAnnounceEvt{},
 	"GameEndEvent":                 &GameEndEvent{},
+	"DeclaringMoveCmd":             &DeclaringMoveCmd{},
+	"LetsStartTheGameCmd":          &LetsStartTheGameCmd{},
+	"PlayerForfeitingCmd":          &PlayerForfeitingCmd{},
+	"NextTurnStartingCmd":          &NextTurnStartingCmd{},
 }
 
 // this event will originate from the matchmaking service and is sent in the GameChan of the lobby and worker
@@ -258,7 +197,7 @@ type OfficialMoveEvent struct {
 	PlayerID string `json:"playerId"`
 	MoveData string `json:"moveData"`
 }
-
+// this is the struct that will be persisted to postgresql
 type GameStateUpdate struct {
 	gorm.Model       `redis:"-"`
 	pubsub.Event     `redis:"-"`
@@ -297,4 +236,43 @@ type GameEndEvent struct {
 	LoserID         string         `json:"loserId"`
 	WinCondition    string         `json:"moveData"`
 	CombinedMoveLog map[int]string `json:"moveLog"`
+}
+
+type NextTurnStartingCmd struct {
+	pubsub.Event
+	GameID             string
+	PriorPlayerID      string
+	NextPlayerID       string
+	UpcomingMoveNumber int
+}
+
+// this command is sent in by the player when they declare a move but it might be invalid - we quickly check it and if it's invalid we send back an InvalidMoveEvent
+type DeclaringMoveCmd struct {
+	pubsub.Event
+	GameID         string `json:"gameId"`
+	SourcePlayerID string `json:"playerId"`
+	DeclaredMove   string `json:"moveData"`
+}
+
+type CheckForWinConditionCmd struct {
+	pubsub.Event
+	GameID    string `json:"gameId"`
+	MoveCount int    `json:"moveCount"`
+	PlayerID  string `json:"playerId"`
+}
+
+// this event is sent only by the worker's runGame command
+type LetsStartTheGameCmd struct {
+	pubsub.Event
+	GameID          string `json:"gameId"`
+	NextMoveNumber  int    `json:"nextMoveNumber"`
+	InitialPlayerID string `json:"initialPlayerId"`
+	SwapPlayerID    string `json:"swapPlayerId"`
+}
+
+type PlayerForfeitingCmd struct {
+	pubsub.Event
+	GameID         string `json:"gameId"`
+	SourcePlayerID string `json:"playerId"`
+	Reason         string `json:"reason"`
 }

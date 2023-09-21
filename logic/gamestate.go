@@ -19,115 +19,13 @@ type GameController struct {
 	WorkerID   string
 	MsgChan    chan interface{} // this chan connects the worker to players/front end, tells it when to start a game and it recieved signal that game is over
 	Persister  *hex.GameStatePersister
-	Errlog     *logger.Logger
+	Errlog     *zap.Logger
 	GameID     string
 	Timer      *timer.TimerControl
 	Id_PlayerA string
 	Id_PlayerB string
 }
 
-func (gc *GameController) HandleGameStateUpdate(newMove *hex.GameStateUpdate) interface{} {
-	pg := gc.Persister.Postgres
-	rs := gc.Persister.Redis
-
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	defer cancelFunc()
-
-	// Assuming you have a zap logger instance called `logger`
-	logger := storage.InitLogger("path/to/logs/gamestate.log", gormlogger.LogLevel(0))
-	ctx = context.WithValue(ctx, "logger", logger)
-
-	playerID := newMove.PlayerID
-
-	moveCounter := newMove.MoveCounter
-	gameID := newMove.GameID
-	xCoord := newMove.XCoordinate
-	yCoord := newMove.YCoordinate
-
-	newVert, err := ConvertToTypeVertex(xCoord, yCoord)
-	if err != nil {
-		//handle
-	}
-
-	// retrieve adjacency matrix and movelist from redis, with postgres as fall back option
-	oldAdjG, oldMoveList := storage.FetchGameState(ctx, gameID, playerID, rs, pg)
-	newAdjG, newMoveList := IncorporateNewVert(ctx, oldMoveList, oldAdjG, newVert)
-
-	// DONE UPDATING GAMESTATE! NOW WE USE IT
-	win_yn := EvalWinCondition(newAdjG, newMoveList)
-
-	// ... AND SAVE IT
-	err = storage.PersistGameState_sql(ctx, newMove, pg)
-	if err != nil {
-		// Handle the error
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(2) // two persistence actions
-
-	go func() {
-		defer wg.Done()
-		r := retry.RetryFunc(ctx, func() (string, interface{}, error) {
-			err := storage.PersistGraphToRedis(ctx, newAdjG, gameID, playerID, rs)
-			return "", nil, err
-		})
-		if r.Err != nil {
-			// Handle the error, possibly by logging it
-			logger.Error(ctx, "Failed to persist graph to Redis: %v", zap.Error(r.Err))
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		r := retry.RetryFunc(ctx, func() (string, interface{}, error) {
-			err := storage.PersistMoveToRedisList(ctx, newVert, gameID, playerID, rs)
-			return "", nil, err
-		})
-		if r.Err != nil {
-			// Handle the error, possibly by logging it
-			logger.Error(ctx, "Failed to persist move List to Redis: %v", zap.Error(r.Err))
-		}
-	}()
-
-	wg.Wait() // Wait for both persistence actions to complete
-
-	// cancel the context for this event handling
-	cancelFunc()
-
-	if win_yn {
-		// use the lockedGames map to ascertain who opponent is (ie who's turn is next )
-		lg := hex.AllLockedGames[gameID] //check all lockedGames map
-		loserID := lg.Player1.PlayerID
-		if lg.Player1.PlayerID == playerID {
-			loserID = lg.Player2.PlayerID
-		}
-
-		newEvt := &hex.GameEndEvent{
-			GameID:   gameID,
-			WinnerID: playerID,
-			LoserID:  loserID,
-
-			WinCondition: "A True Win",
-		}
-		return newEvt
-
-	} else {
-		nextPlayer := "P2"
-		if playerID != "P1" {
-			nextPlayer = "P1"
-		}
-
-		newCmd := &hex.NextTurnStartingCmd{
-			GameID:             gameID,
-			PriorPlayerID:      playerID,
-			NextPlayerID:       nextPlayer,
-			UpcomingMoveNumber: moveCounter + 1,
-		}
-		return newCmd
-	}
-
-	// include a check to compare redis and postgres?
-}
 
 // ..... CHECKING FOR WIN CONDITION
 

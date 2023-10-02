@@ -4,8 +4,9 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	hex "github.com/mikeyg42/HEX/models"
+
 	"github.com/google/uuid"
+	hex "github.com/mikeyg42/HEX/models"
 )
 
 const (
@@ -52,7 +53,6 @@ func NewGameEventBusManager() *hex.GameEventBusManager {
 		MapGameBuses: make(map[string]*hex.GameEventBus),
 	}
 }
-
 
 func (manager *hex.GameEventBusManager) createAndRegisterNewGameBus(ctx context.Context) *hex.GameEventBus {
 
@@ -114,9 +114,6 @@ func createAllGameChannels() map[string]chan []byte {
 
 	return allGameChannels
 }
-
-
-
 
 type turnStartTurnTimerON_evt struct {
 }

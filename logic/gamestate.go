@@ -1,31 +1,26 @@
 package logic
 
 import (
-	"context"
-	"sync"
-
 	hex "github.com/mikeyg42/HEX/models"
-	"github.com/mikeyg42/HEX/retry"
-	storage "github.com/mikeyg42/HEX/storage"
-	timer "github.com/mikeyg42/HEX/timerpkg"
+	// "github.com/mikeyg42/HEX/retry"
+
+	// timer "github.com/mikeyg42/HEX/timerpkg"
 	zap "go.uber.org/zap"
-	gormlogger "gorm.io/gorm/logger"
 )
 
 const SideLenGameboard = 15
 const maxRetries = 3
 
 type GameController struct {
-	WorkerID   string
-	MsgChan    chan interface{} // this chan connects the worker to players/front end, tells it when to start a game and it recieved signal that game is over
-	Persister  *hex.GameStatePersister
-	Errlog     *zap.Logger
-	GameID     string
-	Timer      *timer.TimerControl
+	WorkerID  string
+	MsgChan   chan interface{} // this chan connects the worker to players/front end, tells it when to start a game and it recieved signal that game is over
+	Persister *hex.GameStatePersister
+	Errlog    *zap.Logger
+	GameID    string
+	//	Timer      *timer.TimerControl
 	Id_PlayerA string
 	Id_PlayerB string
 }
-
 
 // ..... CHECKING FOR WIN CONDITION
 

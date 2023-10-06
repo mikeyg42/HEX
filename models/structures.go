@@ -19,10 +19,7 @@ type Topic struct {
 }
 
 type SliceOfSubscribeChans []chan []byte // an array of all the channels that subscribe to a given topic,
-
-
-
-
+// so that when a message is published to that topic, it can be broadcast to all the subscribers
 
 type LobbyEvent struct {
 	Data       [2]string
@@ -75,7 +72,8 @@ type MemoryInterface interface {
 	FetchIndividualMoveList()
 	DeleteGameFromMemory()
 }
-// there will be two of these of course
+
+// there will be two of these, of course
 type PlayerController interface {
 	PostMove()
 	RequestGamestate()

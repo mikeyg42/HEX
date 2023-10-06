@@ -10,7 +10,7 @@ import (
 
 	pgx "github.com/jackc/pgx/v5"
 	pgxpool "github.com/jackc/pgx/v5/pgxpool"
-	SQL_namedPreparedStmts "github.com/mikeyg42/HEX/storage/sqlconstants"
+	SQL_namedPreparedStmts "github.com/mikeyg42/HEX/sqlconstants/sqlconstants"
 	pgxUUID "github.com/vgarvardt/pgx-google-uuid/v5"
 )
 const maxReadPoolSize = 10
@@ -29,7 +29,14 @@ type pooledConnections struct {
 	readPool      *pgxpool.Pool
 	writePool     *pgxpool.Pool
 }
-
+/* 
+AddMoveToMemory()
+UpdateTableNewGameStatus()
+InitializeNewSetOfEntriesToTable()
+FetchCombinedMoveList()
+FetchIndividualMoveList()
+DeleteGameFromMemory()
+ */
 
 func main() {
 
@@ -242,7 +249,7 @@ func poolWithMaxSize(ctx context.Context, poolConfig *pgxpool.Config, maxConns i
 
 func isDatabaseSetupCorrectly(ctx context.Context, p *pooledConnections) (bool, error) {
 	pool := p.readPool
-	
+
 	// 1. Check for table existence
 	tables := []string{"users", "games", "moves"}
 	for _, table := range tables {

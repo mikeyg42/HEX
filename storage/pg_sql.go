@@ -193,7 +193,8 @@ func (p *pooledConnections) InitializeConnPools(ctx context.Context)  {
 }
 
 // check that the pools are working one at a time
-func PingPooledConnections(ctx context.Context, pool *pgxpool.Pool) error {
+func PingPooledConnections(ctx context.Context, p *pooledConnections) error {
+	pool:= p.writePool
 	err := pool.Ping(ctx)
 	if err != nil {
 		err = fmt.Errorf("Unable to ping connection writepool: %v\n", err)
@@ -236,4 +237,72 @@ func poolWithMaxSize(ctx context.Context, poolConfig *pgxpool.Config, maxConns i
 	}
 
 	return pgxpool.NewWithConfig(ctx, poolConfig)
+}
+
+
+func isDatabaseSetupCorrectly(ctx context.Context, p *pooledConnections) (bool, error) {
+	pool := p.readPool
+	
+	// 1. Check for table existence
+	tables := []string{"users", "games", "moves"}
+	for _, table := range tables {
+		var tablename string
+		err := pool.QueryRow(ctx, "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = $1;", table).Scan(&tablename)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				return false, fmt.Errorf("table %s does not exist", table)
+			}
+			return false, err
+		}
+	}
+
+	// 2. Check for roles existence
+	roles := []string{"app_read", "app_write", "app_auth"}
+	for _, role := range roles {
+		var rolname string
+		err := pool.QueryRow(ctx, "SELECT rolname FROM pg_roles WHERE rolname = $1;", role).Scan(&rolname)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				return false, fmt.Errorf("role %s does not exist", role)
+			}
+			return false, err
+		}
+	}
+
+	var currentUser string
+	err := pool.QueryRow(context.Background(), "SELECT current_user").Scan(&currentUser)
+	if err != nil {
+		// handle error
+	}
+
+	if currentUser == "app_read" || currentUser == "app_write" {
+		// make a dummy game entry
+		userID := "dummy-uuid-string"
+		ct, err := pool.Exec(context.Background(), "AddNewGame", userID, userID)
+		if err != nil {
+			panic(fmt.Errorf("Failed to execute prepared statement: %v\n", err))
+		}
+
+
+	// 3. Insert and retrieve dummy data 
+	
+	ct, err = pool.Exec(ctx, "INSERT INTO users(user_id, username, password_hash) VALUES($1, 'dummyuser', 'dummypassword') ON CONFLICT DO NOTHING;", userID)
+	if err != nil {
+		return false, fmt.Errorf("failed to insert dummy data into users: %w", err)
+	}
+
+	var retrievedID string
+	err = pool.QueryRow(ctx, "SELECT user_id FROM users WHERE username = 'dummyuser';").Scan(&retrievedID)
+	if err != nil {
+		return false, fmt.Errorf("failed to retrieve dummy data from users: %w", err)
+	}
+	if retrievedID != userID {
+		return false, errors.New("retrieved dummy data does not match inserted data")
+	}
+
+	// Note: Make sure to remove the dummy data afterwards, either in this function or another cleanup function.
+	}
+
+	return true, nil
+
 }

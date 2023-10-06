@@ -28,13 +28,15 @@ END;
 $$ LANGUAGE plpgsql;
 `
 
+// NOTE: we need to add timestamp for each game
+
 // Function to initiate a new game. pgx will generate its own uuid
 const Add_new_game = `
 CREATE OR REPLACE FUNCTION add_new_game(p_playerA_id UUID, p_playerB_id UUID) 
 RETURNS void AS $$
 BEGIN
-    INSERT INTO games (game_id, playerA_id, playerB_id)
-    VALUES (uuid_generate_v4(), p_playerA_id, p_playerB_id);
+    INSERT INTO games (game_id, playerA_id, playerB_id, outcome)
+    VALUES (uuid_generate_v4(), p_playerA_id, p_playerB_id, 'ongoing');
 END;
 $$ LANGUAGE plpgsql;
 `
@@ -179,7 +181,7 @@ GRANT EXECUTE ON FUNCTION update_game_outcome(UUID, game_outcome), add_new_user(
 `
 
 const CreateRoles = `
-CREATE ROLE app_read;
-CREATE ROLE app_write;
-CREATE ROLE app_auth;
+CREATE ROLE IF NOT EXISTS app_read;
+CREATE ROLE IF NOT EXISTS app_write;
+CREATE ROLE IF NOT EXISTS app_auth;
 `

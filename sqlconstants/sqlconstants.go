@@ -33,10 +33,16 @@ $$ LANGUAGE plpgsql;
 // Function to initiate a new game. pgx will generate its own uuid
 const Add_new_game = `
 CREATE OR REPLACE FUNCTION add_new_game(p_playerA_id UUID, p_playerB_id UUID) 
-RETURNS void AS $$
+RETURNS UUID AS $$
+DECLARE
+    new_game_id UUID;
 BEGIN
     INSERT INTO games (game_id, playerA_id, playerB_id, outcome)
     VALUES (uuid_generate_v4(), p_playerA_id, p_playerB_id, 'ongoing');
+    RETURNING game_id INTO new_game_id;
+    
+    RETURN new_game_id;
+
 END;
 $$ LANGUAGE plpgsql;
 `

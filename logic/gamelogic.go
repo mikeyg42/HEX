@@ -1,9 +1,9 @@
 package logic
 
+
 import (
 	"context"
 	"fmt"
-
 	hex "github.com/mikeyg42/HEX/models"
 )
 
@@ -184,7 +184,6 @@ func ConvertToTypeVertex(xCoord string, yCoord int) (hex.Vertex, error) {
 			X: x, Y: yCoord}, err
 	}
 	return hex.Vertex{
-		X: x, 
-		Y: yCoord,}, nil
+		X: x,
+		Y: yCoord}, nil
 }
-

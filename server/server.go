@@ -1,8 +1,9 @@
-package main
+package server
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net"
@@ -12,12 +13,17 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
+	"encoding/json"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 
 	"nhooyr.io/websocket"
+	"nhooyr.io/websocket/wsjson"
+
+	hex "github.com/mikeyg42/HEX/models"
 )
+
+const topicCodeLength = 5 // fixed legth of the topic code
 
 // move this to the main MAIN funtion
 func main() {
@@ -27,8 +33,7 @@ func main() {
 	}
 }
 
-// run initializes the lobbyServer and then
-// starts a http.Server for the passed in addresserver.
+// run initializes the lobbyServer and starts the HTTP server.
 func runWebsocketServer(tcpAddr string) error {
 	mainCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -39,16 +44,18 @@ func runWebsocketServer(tcpAddr string) error {
 	}
 	log.Printf("listening on http://%v", listener.Addr())
 
-	cs := newChatServer()
+	// Create a new HTTP server and set the base context to our main context.
 	server := &http.Server{
-		Handler: cs,
+		Handler: newChatServer(),
 		BaseContext: func(_ net.Listener) context.Context {
 			return mainCtx // each request's context r.Context() to be derived from our main context.
 		},
 		ReadTimeout:  time.Second * 10,
 		WriteTimeout: time.Second * 10,
+		// set the max read and write too??
 	}
 
+	// make error channel to consolidate for errors from the server
 	egroup, eGroupCtx := errgroup.WithContext(mainCtx)
 
 	// Goroutine for serving HTTP
@@ -71,6 +78,7 @@ func runWebsocketServer(tcpAddr string) error {
 			}
 			log.Println("server gracefully shut down")
 		}
+
 		return nil
 	})
 
@@ -85,27 +93,21 @@ func runWebsocketServer(tcpAddr string) error {
 
 // lobbyServer enables broadcasting to a set of subscriberserver.
 type lobbyServer struct {
-	// subscriberEventMsgBuffer controls the max number
-	// of eventMsgs that can be queued for a subscriber
-	// before it is kicked.
-	//
-	// Defaults to 16.
+	// max number of eventMsgs that can be queued for a subscriber before it is lost. Defaults to 16.
 	subscriberEventMsgBuffer int
 
 	// publishLimiter controls the rate limit applied to the publish endpoint.
-	//
 	// Defaults to one publish every 100ms with a burst of 8.
 	publishLimiter *rate.Limiter
 
-	// logf controls where logs are sent.
-	// Defaults to log.Printf.
+	// where logs are sent.
 	logf func(f string, v ...interface{})
 
 	// serveMux routes the various endpoints to the appropriate handler.
 	serveMux http.ServeMux
 
 	subscribersMu sync.Mutex
-	subscribers   map[*subscriber]struct{}
+	subscribers   map[*subscriber]struct{} // struct contains the events channel and a func to call if they "cant hang"
 }
 
 // newChatServer constructs a lobbyServer with the defaultserver.
@@ -123,12 +125,10 @@ func newChatServer() *lobbyServer {
 	return lobbyServ
 }
 
-// subscriber represents a subscriber.
-// EventMsgs are sent on the EventMessage channel and if the client
-// cannot keep up with the eventMsgs, closeSlow is called.
+// EventMsgs are sent on the EventMessage channel and .
 type subscriber struct {
-	msgs      chan []byte
-	closeSlow func()
+	evts         chan []byte // channel to receive dispatches from eventBus
+	closeTooSlow func()      // if the client cannot keep up with the eventMsgs, closeTooSlow is called
 }
 
 func (lobbyServ *lobbyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -178,29 +178,23 @@ func (lobbyServ *lobbyServer) publishHandler(w http.ResponseWriter, r *http.Requ
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// subscribe subscribes the given WebSocket to all broadcast eventMsgserver.
-// It creates a subscriber with a buffered msgs chan to give some room to slower
-// connections and then registers the subscriber. It then listens for all eventMsgs
-// and writes them to the WebSocket. If the context is cancelled or
-// an error occurs, it returns and deletes the subscription.
-//
-// It uses CloseRead to keep reading from the connection to process control
-// eventMsgs and cancel the context if the connection dropserver.
+// creates a subscriber
 func (lobbyServ *lobbyServer) subscribe(ctx context.Context, c *websocket.Conn) error {
-	ctx = c.CloseRead(ctx)
+	ctx = websocket.c.CloseRead(ctx)
+	// this fcn closeRead keeps reading from the connection for a while to process pings and stuff
 
 	s := &subscriber{
-		msgs: make(chan []byte, lobbyServ.subscriberEventMsgBuffer),
-		closeSlow: func() {
+		evts: make(chan []byte, lobbyServ.subscriberEventMsgBuffer),
+		closeTooSlow: func() {
 			c.Close(websocket.StatusPolicyViolation, "connection too slow to keep up with eventMsgs")
 		},
 	}
-	lobbyServ.addSubscriber(s)
-	defer lobbyServ.deleteSubscriber(s)
+	lobbyServ.AddSubscriber(s) // adds the subscriber to the map
+	defer lobbyServ.DeleteSubscriber(s)
 
 	for {
 		select {
-		case evt := <-s.msgs:
+		case evt := <-s.evts:
 			err := writeTimeout(ctx, time.Second*5, c, evt)
 			if err != nil {
 				return err
@@ -211,9 +205,8 @@ func (lobbyServ *lobbyServer) subscribe(ctx context.Context, c *websocket.Conn) 
 	}
 }
 
-// publish publishes the msg to all subscriberserver.
-// It never blocks and so eventMsgs to slow subscribers are dropped.
-func (lobbyServ *lobbyServer) publish(msg []byte) {
+// publish publishes an evt to all subscribers. It never blocks and so eventMsgs to slow subscribers are dropped.
+func (lobbyServ *lobbyServer) publish(evt []byte) {
 	lobbyServ.subscribersMu.Lock()
 	defer lobbyServ.subscribersMu.Unlock()
 
@@ -221,22 +214,22 @@ func (lobbyServ *lobbyServer) publish(msg []byte) {
 
 	for s := range lobbyServ.subscribers {
 		select {
-		case s.msgs <- msg:
+		case s.evts <- evt:
 		default:
-			go s.closeSlow()
+			go s.closeTooSlow()
 		}
 	}
 }
 
-// addSubscriber registers a subscriber.
-func (lobbyServ *lobbyServer) addSubscriber(s *subscriber) {
+// AddSubscriber registers a subscriber into the map.
+func (lobbyServ *lobbyServer) AddSubscriber(s *subscriber) {
 	lobbyServ.subscribersMu.Lock()
 	lobbyServ.subscribers[s] = struct{}{}
 	lobbyServ.subscribersMu.Unlock()
 }
 
-// deleteSubscriber deletes the given subscriber.
-func (lobbyServ *lobbyServer) deleteSubscriber(s *subscriber) {
+// removes a subscriber from the map of subscribers
+func (lobbyServ *lobbyServer) DeleteSubscriber(s *subscriber) {
 	lobbyServ.subscribersMu.Lock()
 	delete(lobbyServ.subscribers, s)
 	lobbyServ.subscribersMu.Unlock()
@@ -247,4 +240,51 @@ func writeTimeout(ctx context.Context, timeout time.Duration, c *websocket.Conn,
 	defer cancel()
 
 	return c.Write(ctx, websocket.EventMsgText, msg)
+}
+
+func ReadFromWebsocket(ctx context.Context, c *websocket.Conn) (string, []byte, error) {
+	msg := make([]byte, 0, 1024)
+	err := wsjson.Read(ctx, c, &msg)
+	if err != nil {
+		return "", nil, err
+	}
+
+	// Ensure you've read enough bytes for the topic.
+	if len(msg) < topicCodeLength+2 {
+		return "", nil, errors.New("message too short to contain topic")
+	}
+
+	// Extract topic and return
+	topic := string(msg[:topicCodeLength])
+	return topic, msg[topicCodeLength+1:], nil
+}
+
+func WriteToWebsocket(ctx context.Context, c *websocket.Conn, msg []byte) error {
+	yn_json := json.Valid([]byte(msg))
+	if yn_json {
+		err := wsjson.Write(ctx, c, msg)
+		return err
+	}
+	
+	return fmt.Errorf("message is not valid json")
+}
+
+func handleWebsocketConnection(ctx context.Context, c *websocket.Conn, geb *hex.GameEventBus) {
+	for {
+		msg, _, err := ReadFromWebsocket(ctx, c)
+		if err != nil {
+			// Handle read error.
+			return
+		}
+
+		geb.DispatchMessage(msg)
+	}
+}
+
+
+// you need to use this
+
+func prependTopicToPayload(topic string, payload []byte) []byte {
+	topicBytes := []byte(topic + hex.Delimiter)
+	return append(topicBytes, payload...)
 }

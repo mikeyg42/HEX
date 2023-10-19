@@ -180,14 +180,17 @@ GRANT INSERT, UPDATE, DELETE ON games, moves TO app_write;
 GRANT SELECT(username, user_id) ON users TO app_read;
 GRANT SELECT(password_hash) ON users TO app_auth;
 `
-
+5
 const GrantExecute = `
 GRANT EXECUTE ON FUNCTION add_new_game(UUID, UUID), fetch_ongoing_games(UUID, UUID), delete_game(UUID) TO app_read, app_write;
 GRANT EXECUTE ON FUNCTION update_game_outcome(UUID, game_outcome), add_new_user(TEXT, TEXT) TO app_write;
+GRANT EXECUTE ON FUNCTION          TO tester;
+
 `
 
 const CreateRoles = `
 CREATE ROLE IF NOT EXISTS app_read;
 CREATE ROLE IF NOT EXISTS app_write;
 CREATE ROLE IF NOT EXISTS app_auth;
+CREATE ROLE IF NOT EXISTS tester;
 `

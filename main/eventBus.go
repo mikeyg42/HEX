@@ -29,7 +29,7 @@ func main() {
 	ctx := context.Background()
 
 	// lobby starts listening for matchmaking events and broadcasting them to the players
-	go lobby.MatchmakingLoop(ctx)
+	go MatchmakingLoop(lobby, ctx)
 
 	// to create a new GameEventBus instances
 
@@ -113,6 +113,39 @@ func createAllGameChannels() map[string]chan []byte {
 	}
 
 	return allGameChannels
+}
+
+
+type MatchmakingTask struct {
+    MatchData []byte
+    PlayerChannels map[string]chan []byte  // a mapping of player IDs to their channels
+    Process func([]byte, map[string]chan []byte) error
+}
+type Pool struct {
+    MatchmakingTasks chan MatchmakingTaskorder 
+}
+
+func (manager *hex.GameEventBusManager) CreateRefereePool(maxGoroutines int) *RefereePool {
+    p := &RefereePool{
+        Tasks: make(chan Task),
+    }
+    for i := 0; i < maxGoroutines; i++ {
+        go p.RefRoutine()
+    }
+    return p
+}
+
+func (p *RefereePool) RefRoutine() {
+	for task := range p.Tasks {
+        err := task.Process(task.Data)
+        if err != nil {
+            // Handle the error or send it to a results channel
+        }
+    }
+}
+
+
+
 }
 
 type turnStartTurnTimerON_evt struct {

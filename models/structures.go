@@ -1,17 +1,21 @@
-package models 
+package models
 
-import(
+import (
 	"time"
 
+	"github.com/google/uuid"
 )
 
-
+const Delimiter = "#"
 
 type EvtData struct {
-	Data       interface{}
-	Topic      Topic
-	Originator string
-	TimeStamp  time.Time
+	EventData      string    `json:"event_type"`
+	EventType      string    `json:"event_type"`
+	Topic          Topic     `json:"-"`
+	GameID         uuid.UUID `json:"game_id"`
+	OriginatorUUID uuid.UUID `json:"original_sender"`
+	TimeStamp      time.Time `json:"timestamp"`
+	EventIDNUM     int       `json:"event_id"`
 }
 
 type Topic struct {
@@ -33,8 +37,6 @@ type Player struct {
 	EventChannel chan []byte // the player broadcasts on this channel to the lobby
 }
 
-
-
 // -,-,-,-,-,- CAST OF CHARACTERS IN EACH GAME -`-`-`-`-`- \\
 
 type TimerController interface {
@@ -44,10 +46,10 @@ type TimerController interface {
 }
 
 type LobbyController interface {
-	PublishPairing() //done 
+	PublishPairing()    //done
 	LockPairIntoMatch() //partly done
 	CleanupAfterMatch() // need to write
-	MatchmakingLoop() //done
+	MatchmakingLoop()   //done
 }
 
 type Referee interface {
@@ -65,18 +67,17 @@ type CacheManager interface {
 }
 
 type MemoryInterface interface {
-	AddMoveToMemory()
-	UpdateTableNewGameStatus()
-	InitializeNewSetOfEntriesToTable()
-	FetchCombinedMoveList()
-	FetchIndividualMoveList()
-	DeleteGameFromMemory()
+	AddMove_persist()
+	CompleteGame_persist() // double check you did not miss any moves and then update the game status
+	NewGame_persist()
+	FetchMoveList() // can be used to fetch the entire game history of BOTH or JUST 1 player
+	DeleteGame_persist()
 }
 
 // there will be two of these, of course
 type PlayerController interface {
 	PostMove()
 	RequestGamestate()
-	Acknowledge()
-	Reconnect()
+	Ack()
+	AnnounceConnect() // this needs to happen when players are able to start game. and also after a disconnection
 }

@@ -13,26 +13,32 @@ type Lobby struct {
 	PlayerChans        map[string]chan []byte // the lobby broadcasts on these channels to all players
 }
 
-func (l *Lobby) MatchmakingLoop(ctx context.Context) {
+func MatchmakingLoop(l *Lobby, ctx context.Context) {
 	for {
 		select {
-		case <-ctx.Done():
-			return
-		case match := <-l.MatchmakingService:
+			case <-ctx.Done():
+				return
+			case match := <-l.MatchmakingService:
 
-			// broadcast the match to all players
-			twoPlyers := l.PublishPairing(match)
+				// broadcast the match to all players
+				twoPlayers := l.PublishPairing(match)
 
-			// Wait for acks from both players
-			ctx2, cancel := context.WithTimeout(ctx, time.Until(time.Now().Add(5*time.Second)))
-			defer cancel()
-			for {
+				// Wait for acks from both players
+				ctx2, cancel := context.WithTimeout(ctx, time.Until(time.Now().Add(5*time.Second)))
+				defer cancel()
+				for {
+					select {
+					case <-ctx2.Done():
+						// handle timeout
+						return
+					case :	// players will need to send acknowleding events to the lobby by way of their player chans 
+					
+					//??
+				
+					}
+				}
 			}
-
-			//????
-
 			l.LockPairIntoMatch(twoPlayers)
-
 		}
 	}
 }
@@ -45,7 +51,7 @@ func (l *Lobby) PublishPairing(match []byte) [2]string {
 		panic(err)
 	}
 
-	announcePair := LobbyEvent{
+	announcePair := hex.LobbyEvent{
 		data:       playerIDs,
 		originator: "MatchmakingService",
 		timeStamp:  time.Now(),
@@ -66,6 +72,7 @@ func (l *Lobby) PublishPairing(match []byte) [2]string {
 
 func CreateTopics() []hex.Topic {
 	return []hex.Topic{
+		hex.Topic{TestTopic},
 		hex.Topic{TimerTopic},
 		hex.Topic{GameLogicTopic},
 		hex.Topic{MetagameTopic},

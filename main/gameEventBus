@@ -3,9 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
-	hex "github.com/mikeyg42/HEX/models"
+	"strings"
 	"sync"
-	"time"
+
+	hex "github.com/mikeyg42/HEX/models"
 )
 
 type GameEventBus struct {
@@ -58,11 +59,11 @@ func (geb *GameEventBus) marshalAndForward(inChan chan EvtData) {
 	}
 }
 
-
 func (geb *GameEventBus) DefineTopicSubscriptions(topics []hex.Topic) {
 	geb.Rwm.Lock()
 	defer geb.Rwm.Unlock()
 
+	// iterates through each of the topics and appends to the slice of subscribers for that topic those players
 	for _, topic := range topics {
 		subscriberSlice := hex.SliceOfSubscribeChans{}
 		switch topic.topicName {
@@ -86,4 +87,35 @@ func (geb *GameEventBus) DefineTopicSubscriptions(topics []hex.Topic) {
 	}
 
 	return
+}
+
+
+// This function assumes that messages are formatted as `topic#actual_message`.
+func (geb *GameEventBus) DispatchMessage(rawMsg []byte) {
+	parts := strings.SplitN(string(rawMsg), Delimiter, 2)
+	if len(parts) != 2 {
+		// Handle this error. Maybe log it or return an error.
+		return
+	}
+
+	topic := parts[0]
+	message := parts[1]
+
+	channels, ok := geb.getChannelsForTopic(topic)
+	if !ok {
+		// Handle this case. The topic doesn't exist.
+		return
+	}
+
+	for _, ch := range channels {
+		ch <- []byte(message) // dispatching the actual message without the topic prefix.
+	}
+}
+
+func (geb *GameEventBus) getChannelsForTopic(topic string) ([]chan []byte, bool) {
+	geb.Rwm.RLock()
+	defer geb.Rwm.RUnlock()
+
+	chs, ok := geb.SubscribersForEachTopic[hex.Topic{topicName: topic}]
+	return chs, ok
 }

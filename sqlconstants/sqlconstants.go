@@ -60,16 +60,6 @@ END;
 $$ LANGUAGE plpgsql;
 `
 
-// Function to delete a specified game from 'games'.
-const Delete_game = `
-CREATE OR REPLACE FUNCTION delete_game(p_game_id UUID) 
-RETURNS void AS $$
-BEGIN
-    DELETE FROM games WHERE game_id = p_game_id;
-END;
-$$ LANGUAGE plpgsql;
-`
-
 // Function to fetch all moves associated with a particular gameID.
 const Fetch_all_moves_for_gameID = `
 CREATE OR REPLACE FUNCTION fetch_all_moves_for_game(p_game_id UUID) 

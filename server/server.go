@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -13,7 +14,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"encoding/json"
+
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 
@@ -265,7 +266,7 @@ func WriteToWebsocket(ctx context.Context, c *websocket.Conn, msg []byte) error 
 		err := wsjson.Write(ctx, c, msg)
 		return err
 	}
-	
+
 	return fmt.Errorf("message is not valid json")
 }
 
@@ -280,7 +281,6 @@ func handleWebsocketConnection(ctx context.Context, c *websocket.Conn, geb *hex.
 		geb.DispatchMessage(msg)
 	}
 }
-
 
 // you need to use this
 

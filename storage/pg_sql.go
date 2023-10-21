@@ -17,7 +17,7 @@ import (
 	pgxUUID "github.com/vgarvardt/pgx-google-uuid/v5"
 )
 
-var _ persister = &hex.MemoryInterface{}
+var _Persister = &hex.MemoryInterface{}
 
 const maxReadPoolSize = 10
 const maxWritePoolSize = 10
@@ -56,13 +56,7 @@ type Move struct {
 	MoveCounter int `db:"move_counter"`
 }
 
-// This is for the fetch_latest_moves_for_game function
-type LatestMove struct {
-	PlayerGameCode    string `db:"player_game_code"`
-	MoveCounter       int    `db:"move_counter"`
-	MoveDescription   string `db:"move_description"`
-	FormattedMoveTime string `db:"formatted_move_time"`
-}
+//----------------------------------//
 
 func main() {
 
@@ -399,11 +393,11 @@ func DeleteGameMemory(ctx context.Context, gameID string, writePool *pgxpool.Poo
 	return nil
 }
 
-func InitiateNewGame(playerA, playerB uuid.UUID, writePool *pgxpool.Pool) (gameID, error) {
+func InitiateNewGame(playerA, playerB uuid.UUID, writePool *pgxpool.Pool) (uuid.UUID, error) {
 	var newGameID uuid.UUID
 
 	// Use the name of the prepared statement, provide the required parameters, and scan the result into newGameID
-	err := writePool.QueryRow(context.Background(), "AddNewGame", playerAID, playerBID).Scan(&newGameID)
+	err := writePool.QueryRow(context.Background(), "AddNewGame", playerA, playerB).Scan(&newGameID)
 	if err != nil {
 		fmt.Println("Failed to execute prepared statement AddNewGame: %v\n", err)
 		return uuid.Nil, err
@@ -417,11 +411,11 @@ func AddMoveToMemory(move Move, pool *pgxpool.Pool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := pool.QueryRow(context.Background(), "Add_New_Move", move.GameID, move.PlayerIdentifier, move.MoveDescript)
+	err := pool.QueryRow(ctx, "Add_New_Move", move.GameID, move.PlayerID, move.MoveDescription)
 
 	if err != nil {
 		time.Sleep(retryDelay)
-		err := pool.QueryRow(context.Background(), "Add_New_Move", move.GameID, move.PlayerIdentifier, move.MoveDescript)
+		err := pool.QueryRow(ctx, "Add_New_Move", move.GameID, move.PlayerID, move.MoveDescription)
 
 		if err != nil {
 			panic(fmt.Errorf("Unable to add move to moves table: %v\n", err))
@@ -431,7 +425,7 @@ func AddMoveToMemory(move Move, pool *pgxpool.Pool) error {
 	return err
 }
 
-func FetchLatestThreeMovesInGame(gameID uuid.UUID, readPool *pgxpool.Pool) ([]LatestMove, error) {
+func FetchLatestThreeMovesInGame(gameID uuid.UUID, readPool *pgxpool.Pool) ([]Move, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -445,10 +439,10 @@ func FetchLatestThreeMovesInGame(gameID uuid.UUID, readPool *pgxpool.Pool) ([]La
 	}
 	defer rows.Close()
 
-	var latestMoves []LatestMove // LatestMove is a struct representing a latest move, define it accordingly.
+	var latestMoves []Move 
 	for rows.Next() {
-		var move LatestMove
-		err := rows.Scan(&move.PlayerGameCode, &move.MoveCounter, &move.Description, &move.FormattedMoveTime)
+		var move Move
+		err := rows.Scan(&move.PlayerGameCode, &move.MoveCounter, &move.MoveDescription, &move.FormattedMoveTime)
 		if err != nil {
 			return nil, err
 		}

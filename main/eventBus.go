@@ -9,12 +9,6 @@ import (
 	hex "github.com/mikeyg42/HEX/models"
 )
 
-const (
-	TimerTopic     = "timer_topic"
-	GameLogicTopic = "gamelogic_topic"
-	MetagameTopic  = "metagame_topic"
-	ResultsTopic   = "results_topic"
-)
 
 func main() {
 	manager := NewGameEventBusManager()
@@ -79,6 +73,16 @@ func (manager *hex.GameEventBusManager) createAndRegisterNewGameBus(ctx context.
 	return gameBus
 }
 
+func CreateTopics() []hex.Topic {
+	return []hex.Topic{
+		hex.Topic{TestTopic},
+		hex.Topic{TimerTopic},
+		hex.Topic{GameLogicTopic},
+		hex.Topic{MetagameTopic},
+		hex.Topic{ResultsTopic},
+	}
+}
+
 func (manager *hex.GameEventBusManager) FetchGameBus(gameID string) (*hex.GameEventBus, bool) {
 	manager.Mu.RLock()
 	defer manager.Mu.RUnlock()
@@ -115,37 +119,38 @@ func createAllGameChannels() map[string]chan []byte {
 	return allGameChannels
 }
 
-
 type MatchmakingTask struct {
-    MatchData []byte
-    PlayerChannels map[string]chan []byte  // a mapping of player IDs to their channels
-    Process func([]byte, map[string]chan []byte) error
+	MatchData      []byte
+	PlayerChannels map[string]chan []byte // a mapping of player IDs to their channels
+	Process        func([]byte, map[string]chan []byte) error
 }
 type Pool struct {
-    MatchmakingTasks chan MatchmakingTaskorder 
+	MatchmakingTasks chan MatchmakingTask
 }
 
 func (manager *hex.GameEventBusManager) CreateRefereePool(maxGoroutines int) *RefereePool {
-    p := &RefereePool{
-        Tasks: make(chan Task),
-    }
-    for i := 0; i < maxGoroutines; i++ {
-        go p.RefRoutine()
-    }
-    return p
+	p := &RefereePool{
+		RefTasks: make(chan RefTask),
+	}
+	for i := 0; i < maxGoroutines; i++ {
+		go p.RefRoutine()
+	}
+	return p
 }
 
 func (p *RefereePool) RefRoutine() {
-	for task := range p.Tasks {
-        err := task.Process(task.Data)
-        if err != nil {
-            // Handle the error or send it to a results channel
-        }
-    }
+	for task := range p.RefTasks {
+		err := task.Process(task.Data) //?????
+		if err != nil {
+			// Handle the error or send it to a results channel
+		}
+	}
 }
 
-
-
+type RefereePool struct {
+	RefTasks chan RefTask
+}
+type RefTask struct {
 }
 
 type turnStartTurnTimerON_evt struct {

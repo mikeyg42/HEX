@@ -32,6 +32,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
 }
 
 // run initializes the lobbyServer and starts the HTTP server.
@@ -65,23 +66,8 @@ func runWebsocketServer(tcpAddr string) error {
 	})
 
 	// Goroutine to handle shutdown signals
-	egroup.Go(func() error {
-		select {
-		case <-eGroupCtx.Done():
-			return eGroupCtx.Err()
-		case <-mainCtx.Done():
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-			defer cancel()
-
-			// Trigger graceful shutdown
-			if err := server.Shutdown(shutdownCtx); err != nil {
-				return err
-			}
-			log.Println("server gracefully shut down")
-		}
-
-		return nil
-	})
+	s:= &myServer{server: server}
+	egroup.Go(s.ShutdownServer(eGroupCtx, mainCtx))
 
 	// Wait for all goroutines in the errgroup
 	if err := egroup.Wait(); err != nil && err != http.ErrServerClosed {
@@ -110,6 +96,30 @@ type lobbyServer struct {
 	subscribersMu sync.Mutex
 	subscribers   map[*subscriber]struct{} // struct contains the events channel and a func to call if they "cant hang"
 }
+
+type myServer struct {
+	server *http.Server
+}
+
+func (s *myServer)ShutdownServer(eGroupCtx, mainCtx context.Context) error {
+	for{ 
+		select {
+		case <-eGroupCtx.Done():
+			return eGroupCtx.Err()
+		case <-mainCtx.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second*10)				
+			defer cancel()
+
+			// Trigger graceful server shutdown - give it 10 seconds to try to finish
+			if err := s.server.Shutdown(shutdownCtx); err != nil {
+				return err
+			}
+			log.Println("server gracefully shut down")
+			return nil
+		}
+	}
+}
+
 
 // newChatServer constructs a lobbyServer with the defaultserver.
 func newChatServer() *lobbyServer {
@@ -278,11 +288,15 @@ func handleWebsocketConnection(ctx context.Context, c *websocket.Conn, geb *hex.
 			return
 		}
 
-		geb.DispatchMessage(msg)
+        // Here, you can prepend the topic.
+        topic := "YOUR_TOPIC" // You need to determine how to set the topic.
+        msgWithTopic := prependTopicToPayload(topic, msg)
+
+        geb.DispatchMessage(string(msgWithTopic))
+
 	}
 }
 
-// you need to use this
 
 func prependTopicToPayload(topic string, payload []byte) []byte {
 	topicBytes := []byte(topic + hex.Delimiter)

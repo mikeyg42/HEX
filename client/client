@@ -1,0 +1,59 @@
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "time"
+
+    "nhooyr.io/websocket"
+)
+
+func main() {
+    // WebSocket server URL
+    serverURL := "ws://localhost:8080/subscribe" // Replace with your server's URL
+
+    // Create a context with timeout
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    // Connect to the WebSocket server
+    conn, _, err := websocket.Dial(ctx, serverURL, nil)
+    if err != nil {
+        log.Fatalf("WebSocket connection failed: %v", err)
+    }
+    defer conn.Close(websocket.StatusAbnormalClosure, "Client closed")
+
+    // Start a goroutine to read messages from the server
+    go readMessages(conn)
+
+    // Send a test message to the server
+    message := []byte("Hello, Server!")
+    if err := sendMessage(conn, message); err != nil {
+        log.Fatalf("Failed to send message: %v", err)
+    }
+
+    // Wait for some time to receive messages (adjust as needed)
+    time.Sleep(10 * time.Second)
+}
+
+func sendMessage(conn *websocket.Conn, message []byte) error {
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    return conn.Write(ctx, websocket.MessageText, message)
+}
+
+func readMessages(conn *websocket.Conn) {
+    for {
+        messageType, p, err := conn.Read(context.Background())
+        if err != nil {
+            log.Printf("WebSocket read error: %v", err)
+            return
+        }
+
+        if messageType == websocket.MessageText {
+            fmt.Printf("Received message from server: %s\n", p)
+        }
+    }
+}

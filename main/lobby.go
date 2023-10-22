@@ -69,13 +69,3 @@ func (l *Lobby) PublishPairing(match []byte) [2]string {
 
 	return playerIDs
 }
-
-func CreateTopics() []hex.Topic {
-	return []hex.Topic{
-		hex.Topic{TestTopic},
-		hex.Topic{TimerTopic},
-		hex.Topic{GameLogicTopic},
-		hex.Topic{MetagameTopic},
-		hex.Topic{ResultsTopic},
-	}
-}
